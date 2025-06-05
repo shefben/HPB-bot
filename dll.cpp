@@ -20,6 +20,8 @@
 #include "bot_func.h"
 #include "waypoint.h"
 #include "bot_memory.h" // For LoadBotMemory/SaveBotMemory
+#include "bot_tactical_ai.h" // For TacticalAI functions
+#include "bot_objective_discovery.h" // For Objective Discovery functions
 
 // Define BOT_MEMORY_FILENAME if not globally visible (it's not from bot_memory.cpp's perspective for dll.cpp)
 #ifndef BOT_MEMORY_FILENAME
@@ -626,6 +628,13 @@ void ClientPutInServer( edict_t *pEntity )
 
    RETURN_META (MRES_IGNORED);
 }
+
+
+extern std::vector<CandidateObjective_t> g_candidate_objectives; // Defined in bot_objective_discovery.cpp
+extern std::list<GameEvent_t> g_game_event_log; // Defined in bot_objective_discovery.cpp
+// Prototypes for helpers that might be in bot_objective_discovery.cpp
+const char* ObjectiveTypeToString(ObjectiveType_e obj_type);
+const char* GameEventTypeToString(GameEventType_e event_type);
 
 
 void ClientCommand( edict_t *pEntity )
@@ -1324,6 +1333,75 @@ void ClientCommand( edict_t *pEntity )
 
          RETURN_META (MRES_SUPERCEDE);
       }
+      else if (FStrEq(pcmd, "bot_list_candidates"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) {
+               ClientPrint(pEntity, HUD_PRINTCONSOLE, "This command is for listen server admin only.\n");
+               RETURN_META(MRES_SUPERCEDE);
+          }
+
+          char msg[512];
+          sprintf(msg, "--- Candidate Objectives (Count: %zu) ---\n", g_candidate_objectives.size());
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, msg);
+
+          for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
+              const CandidateObjective_t& cand = g_candidate_objectives[i];
+              const char* type_str = ObjectiveTypeToString(cand.learned_objective_type);
+
+              sprintf(msg, "ID:%d|T:%s|C:%.2f|P:%d|N:%d|L:(%.0f,%.0f,%.0f)|Cls:%s|Tgt:%s|Team:%d@%.1f\n",
+                      cand.unique_id,
+                      type_str,
+                      cand.confidence_score,
+                      cand.positive_event_correlations,
+                      cand.negative_event_correlations,
+                      cand.location.x, cand.location.y, cand.location.z,
+                      cand.entity_classname[0] ? cand.entity_classname : "-",
+                      cand.entity_targetname[0] ? cand.entity_targetname : "-",
+                      cand.last_interacting_team,
+                      cand.last_interaction_time
+              );
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, msg);
+          }
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- End of List ---\n");
+          RETURN_META(MRES_SUPERCEDE);
+      }
+      else if (FStrEq(pcmd, "bot_list_events"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) {
+               ClientPrint(pEntity, HUD_PRINTCONSOLE, "This command is for listen server admin only.\n");
+               RETURN_META(MRES_SUPERCEDE);
+          }
+          char msg[512];
+          int count_to_show = 10;
+          const char *arg_count_str = CMD_ARGV(1);
+          if (arg_count_str && arg_count_str[0] != '\0') {
+              count_to_show = atoi(arg_count_str);
+              if (count_to_show <= 0 || count_to_show > 100) count_to_show = 10;
+          }
+
+          sprintf(msg, "--- Last %d Game Events (Total: %zu) ---\n", count_to_show, g_game_event_log.size());
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, msg);
+
+          int shown_count = 0;
+          for (auto it = g_game_event_log.rbegin(); it != g_game_event_log.rend() && shown_count < count_to_show; ++it, ++shown_count) {
+              const GameEvent_t& evt = *it;
+              const char* event_type_str = GameEventTypeToString(evt.type);
+              sprintf(msg, "T:%.1f|Type:%s|T1:%d|T2:%d|CandID:%d|PlyrEdict:%d|VF:%.2f|VI:%d|Msg:'%s'\n",
+                      evt.timestamp,
+                      event_type_str,
+                      evt.primarily_involved_team_id,
+                      evt.secondary_involved_team_id,
+                      evt.candidate_objective_id,
+                      evt.involved_player_user_id,
+                      evt.event_value_float,
+                      evt.event_value_int,
+                      evt.event_message_text[0] ? evt.event_message_text : "-"
+              );
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, msg);
+          }
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- End of Events List ---\n");
+          RETURN_META(MRES_SUPERCEDE);
+      }
 #if _DEBUG
       else if (FStrEq(pcmd, "botstop"))
       {
@@ -1350,56 +1428,47 @@ void StartFrame( void )
       edict_t *pPlayer;
       static int i, index, player_index, bot_index;
       static float previous_time = -1.0;
+      static float next_tactical_update_time = 0.0f; // Static for periodic tactical update
+      static float next_obj_discovery_update_time = 0.0f; // Static for objective discovery update
+      static float next_obj_analysis_time = 0.0f; // Static for objective analysis update
       char msg[256];
       int count;
-
-      // Save bot memory at the end of a map (before new map detection)
-      // This check ensures it only happens if previous_time is initialized (not first frame ever)
-      // and that it's potentially the last frame of a map.
-      if (previous_time > 0.0 &&ชัดเจน((gpGlobals->time + 0.1) >= previous_time)) {
-          // Check if it's truly a map change scenario by peeking if next condition will be true
-          if ((gpGlobals->time + 0.1) < previous_time || gpGlobals->time < previous_time) { // A bit of a heuristic for map change
-             SaveBotMemory(BOT_MEMORY_FILENAME);
-          }
-      }
-      // A more direct place to save would be ServerDeactivate if it existed, or a map shutdown event.
-      // As a fallback, if server is shutting down, perhaps before worldspawn is destroyed.
-      // For now, this tries to save before new map load.
 
       // if a new map has started then (MUST BE FIRST IN StartFrame)...
       if ((gpGlobals->time + 0.1) < previous_time)
       {
          // Save memory from the previous map just before loading the new one.
-         // This ensures that if the server crashes or doesn't call a deactivate, we still save.
-         // However, saving twice (here and above) if both conditions meet isn't ideal.
-         // Let's refine: The above save is a general "late map frame" save.
-         // This specific one is "definitely end of map".
          if (previous_time > 0.0) { // Ensure previous_time was valid from a prior map
             SaveBotMemory(BOT_MEMORY_FILENAME);
          }
 
+         // Load persistent bot memory for the new map
+         LoadBotMemory(BOT_MEMORY_FILENAME);
+
+         // Initialize Tactical AI state AFTER waypoints and bot memory might have been loaded
+         TacticalAI_LevelInit();
+
+         // Initialize Objective Discovery state
+         ObjectiveDiscovery_LevelInit();
+
+         // The rest of the existing new map logic from HPB_bot (like processing map cfg)
          char filename[256];
          char mapname[64];
 
-         // check if mapname_bot.cfg file exists...
-
          strcpy(mapname, STRING(gpGlobals->mapname));
          strcat(mapname, "_HPB_bot.cfg");
-
          UTIL_BuildFileName(filename, "maps", mapname);
 
          if ((bot_cfg_fp = fopen(filename, "r")) != NULL)
          {
             sprintf(msg, "Executing %s\n", filename);
             ALERT( at_console, msg );
-
             for (index = 0; index < 32; index++)
             {
                bots[index].is_used = FALSE;
                bots[index].respawn_state = 0;
                bots[index].f_kick_time = 0.0;
             }
-
             if (IsDedicatedServer)
                bot_cfg_pause_time = gpGlobals->time + 5.0;
             else
@@ -1408,8 +1477,6 @@ void StartFrame( void )
          else
          {
             count = 0;
-
-            // mark the bots as needing to be respawned...
             for (index = 0; index < 32; index++)
             {
                if (count >= prev_num_bots)
@@ -1418,30 +1485,24 @@ void StartFrame( void )
                   bots[index].respawn_state = 0;
                   bots[index].f_kick_time = 0.0;
                }
-
-               if (bots[index].is_used)  // is this slot used?
+               if (bots[index].is_used)
                {
                   bots[index].respawn_state = RESPAWN_NEED_TO_RESPAWN;
                   count++;
                }
-
-               // check for any bots that were very recently kicked...
                if ((bots[index].f_kick_time + 5.0) > previous_time)
                {
                   bots[index].respawn_state = RESPAWN_NEED_TO_RESPAWN;
                   count++;
                }
                else
-                  bots[index].f_kick_time = 0.0;  // reset to prevent false spawns later
+                  bots[index].f_kick_time = 0.0;
             }
-
-            // set the respawn time
             if (IsDedicatedServer)
                respawn_time = gpGlobals->time + 5.0;
             else
                respawn_time = gpGlobals->time + 20.0;
          }
-
          bot_check_time = gpGlobals->time + 60.0;
       }
 
@@ -1450,48 +1511,57 @@ void StartFrame( void )
          if ((listenserver_edict != NULL) && (welcome_sent == FALSE) &&
              (welcome_time < 1.0))
          {
-            // are they out of observer mode yet?
             if (IsAlive(listenserver_edict))
-               welcome_time = gpGlobals->time + 5.0;  // welcome in 5 seconds
+               welcome_time = gpGlobals->time + 5.0;
          }
 
          if ((welcome_time > 0.0) && (welcome_time < gpGlobals->time) &&
              (welcome_sent == FALSE))
          {
             char version[80];
-
             sprintf(version,"%s Version %d.%d\n", welcome_msg, VER_MAJOR, VER_MINOR);
-
-            // let's send a welcome message to this client...
             UTIL_SayText(version, listenserver_edict);
-
-            welcome_sent = TRUE;  // clear this so we only do it once
+            welcome_sent = TRUE;
          }
       }
 
       count = 0;
-
       if (bot_stop == 0)
       {
          for (bot_index = 0; bot_index < gpGlobals->maxClients; bot_index++)
          {
-            if ((bots[bot_index].is_used) &&  // is this slot used AND
-                (bots[bot_index].respawn_state == RESPAWN_IDLE))  // not respawning
+            if ((bots[bot_index].is_used) &&
+                (bots[bot_index].respawn_state == RESPAWN_IDLE))
             {
                BotThink(&bots[bot_index]);
-
                count++;
             }
          }
       }
-
       if (count > num_bots)
          num_bots = count;
+
+      // Periodic Tactical AI Update
+      if (gpGlobals->time >= next_tactical_update_time) {
+          TacticalAI_UpdatePeriodicState();
+          next_tactical_update_time = gpGlobals->time + 1.0f; // Update every 1 second
+      }
+
+      // Periodic Objective Discovery Update
+      if (gpGlobals->time >= next_obj_discovery_update_time) {
+          ObjectiveDiscovery_UpdatePeriodic();
+          next_obj_discovery_update_time = gpGlobals->time + 2.0f; // e.g., every 2 seconds
+      }
+
+      // Periodic Objective Analysis
+      if (gpGlobals->time >= next_obj_analysis_time) {
+          ObjectiveDiscovery_AnalyzeEvents();
+          next_obj_analysis_time = gpGlobals->time + 7.5f; // e.g., every 7.5 seconds
+      }
 
       for (player_index = 1; player_index <= gpGlobals->maxClients; player_index++)
       {
          pPlayer = INDEXENT(player_index);
-
          if (pPlayer && !pPlayer->free)
          {
             if ((g_waypoint_on) &&
@@ -1502,32 +1572,29 @@ void StartFrame( void )
          }
       }
 
-      // are we currently respawning bots and is it time to spawn one yet?
       if ((respawn_time > 1.0) && (respawn_time <= gpGlobals->time))
       {
          int index = 0;
-
-         // find bot needing to be respawned...
          while ((index < 32) &&
                 (bots[index].respawn_state != RESPAWN_NEED_TO_RESPAWN))
             index++;
 
          if (index < 32)
          {
-            int strafe = bot_strafe_percent;  // save global strafe percent
-            int chat = bot_chat_percent;    // save global chat percent
-            int taunt = bot_taunt_percent;  // save global taunt percent
-            int whine = bot_whine_percent;  // save global whine percent
-            int grenade = bot_grenade_time; // save global grenade time
-            int logo = bot_logo_percent;    // save global logo percent
-            int tag = bot_chat_tag_percent;    // save global clan tag percent
-            int drop = bot_chat_drop_percent;  // save global chat drop percent
-            int swap = bot_chat_swap_percent;  // save global chat swap percent
-            int lower = bot_chat_lower_percent; // save global chat lower percent
+            int strafe = bot_strafe_percent;
+            int chat = bot_chat_percent;
+            int taunt = bot_taunt_percent;
+            int whine = bot_whine_percent;
+            int grenade = bot_grenade_time;
+            int logo = bot_logo_percent;
+            int tag = bot_chat_tag_percent;
+            int drop = bot_chat_drop_percent;
+            int swap = bot_chat_swap_percent;
+            int lower = bot_chat_lower_percent;
             int react = bot_reaction_time;
 
             bots[index].respawn_state = RESPAWN_IS_RESPAWNING;
-            bots[index].is_used = FALSE;      // free up this slot
+            bots[index].is_used = FALSE;
 
             bot_strafe_percent = bots[index].strafe_percent;
             bot_chat_percent = bots[index].chat_percent;
@@ -1541,51 +1608,42 @@ void StartFrame( void )
             bot_chat_lower_percent = bots[index].chat_lower_percent;
             bot_reaction_time = bots[index].reaction_time;
 
-            // respawn 1 bot then wait a while (otherwise engine crashes)
+
             if ((mod_id == VALVE_DLL) ||
                 ((mod_id == GEARBOX_DLL) && (pent_info_ctfdetect == NULL)) ||
                 (mod_id == HOLYWARS_DLL) || (mod_id == DMC_DLL))
             {
-               char c_skill[2];
-               char c_topcolor[4];
-               char c_bottomcolor[4];
-
+               char c_skill[2]; char c_topcolor[4]; char c_bottomcolor[4];
                sprintf(c_skill, "%d", bots[index].bot_skill);
                sprintf(c_topcolor, "%d", bots[index].top_color);
                sprintf(c_bottomcolor, "%d", bots[index].bottom_color);
-               
                BotCreate(NULL, bots[index].skin, bots[index].name, c_skill, c_topcolor, c_bottomcolor);
             }
             else
             {
-               char c_skill[2];
-               char c_team[2];
-               char c_class[3];
-
+               char c_skill[2]; char c_team[2]; char c_class[3];
                sprintf(c_skill, "%d", bots[index].bot_skill);
                sprintf(c_team, "%d", bots[index].bot_team);
                sprintf(c_class, "%d", bots[index].bot_class);
-
                if ((mod_id == TFC_DLL) || (mod_id == GEARBOX_DLL))
                   BotCreate(NULL, NULL, NULL, bots[index].name, c_skill, NULL);
                else
                   BotCreate(NULL, c_team, c_class, bots[index].name, c_skill, NULL);
             }
 
-            bot_strafe_percent = strafe;  // restore global strafe percent
-            bot_chat_percent = chat;    // restore global chat percent
-            bot_taunt_percent = taunt;  // restore global taunt percent
-            bot_whine_percent = whine;  // restore global whine percent
-            bot_grenade_time = grenade;  // restore global grenade time
-            bot_logo_percent = logo;  // restore global logo percent
-            bot_chat_tag_percent = tag;    // restore global chat percent
-            bot_chat_drop_percent = drop;    // restore global chat percent
-            bot_chat_swap_percent = swap;    // restore global chat percent
-            bot_chat_lower_percent = lower;    // restore global chat percent
+            bot_strafe_percent = strafe;
+            bot_chat_percent = chat;
+            bot_taunt_percent = taunt;
+            bot_whine_percent = whine;
+            bot_grenade_time = grenade;
+            bot_logo_percent = logo;
+            bot_chat_tag_percent = tag;
+            bot_chat_drop_percent = drop;
+            bot_chat_swap_percent = swap;
+            bot_chat_lower_percent = lower;
             bot_reaction_time = react;
 
-            respawn_time = gpGlobals->time + 2.0;  // set next respawn time
-
+            respawn_time = gpGlobals->time + 2.0;
             bot_check_time = gpGlobals->time + 5.0;
          }
          else
@@ -1596,94 +1654,48 @@ void StartFrame( void )
 
       if (g_GameRules)
       {
-         if (need_to_open_cfg)  // have we open HPB_bot.cfg file yet?
+         if (need_to_open_cfg)
          {
-            char filename[256];
-            char mapname[64];
-
-            need_to_open_cfg = FALSE;  // only do this once!!!
-
-            // check if mapname_HPB_bot.cfg file exists...
-
-            strcpy(mapname, STRING(gpGlobals->mapname));
-            strcat(mapname, "_HPB_bot.cfg");
-
-            UTIL_BuildFileName(filename, "maps", mapname);
-
-            if ((bot_cfg_fp = fopen(filename, "r")) != NULL)
-            {
-               sprintf(msg, "Executing %s\n", filename);
-               ALERT( at_console, msg );
+            char fn_cfg[256]; char mn_cfg[64]; // Renamed to avoid conflict with outer scope 'filename'
+            need_to_open_cfg = FALSE;
+            strcpy(mn_cfg, STRING(gpGlobals->mapname)); strcat(mn_cfg, "_HPB_bot.cfg");
+            UTIL_BuildFileName(fn_cfg, "maps", mn_cfg);
+            if ((bot_cfg_fp = fopen(fn_cfg, "r")) != NULL) {
+                sprintf(msg, "Executing %s\n", fn_cfg); ALERT( at_console, msg );
+            } else {
+                UTIL_BuildFileName(fn_cfg, "HPB_bot.cfg", NULL);
+                sprintf(msg, "Executing %s\n", fn_cfg); ALERT( at_console, msg );
+                bot_cfg_fp = fopen(fn_cfg, "r");
+                if (bot_cfg_fp == NULL) ALERT( at_console, "HPB_bot.cfg file not found\n" );
             }
-            else
-            {
-               UTIL_BuildFileName(filename, "HPB_bot.cfg", NULL);
-
-               sprintf(msg, "Executing %s\n", filename);
-               ALERT( at_console, msg );
-
-               bot_cfg_fp = fopen(filename, "r");
-
-               if (bot_cfg_fp == NULL)
-                  ALERT( at_console, "HPB_bot.cfg file not found\n" );
-            }
-
-            if (IsDedicatedServer)
-               bot_cfg_pause_time = gpGlobals->time + 5.0;
-            else
-               bot_cfg_pause_time = gpGlobals->time + 20.0;
+            if (IsDedicatedServer) bot_cfg_pause_time = gpGlobals->time + 5.0;
+            else bot_cfg_pause_time = gpGlobals->time + 20.0;
          }
 
-         if (!IsDedicatedServer && !spawn_time_reset)
-         {
-            if (listenserver_edict != NULL)
-            {
-               if (IsAlive(listenserver_edict))
-               {
+         if (!IsDedicatedServer && !spawn_time_reset) {
+            if (listenserver_edict != NULL) {
+               if (IsAlive(listenserver_edict)) {
                   spawn_time_reset = TRUE;
-
-                  if (respawn_time >= 1.0)
-                     respawn_time = min(respawn_time, gpGlobals->time + (float)1.0);
-
-                  if (bot_cfg_pause_time >= 1.0)
-                     bot_cfg_pause_time = min(bot_cfg_pause_time, gpGlobals->time + (float)1.0);
+                  if (respawn_time >= 1.0) respawn_time = min(respawn_time, gpGlobals->time + (float)1.0);
+                  if (bot_cfg_pause_time >= 1.0) bot_cfg_pause_time = min(bot_cfg_pause_time, gpGlobals->time + (float)1.0);
                }
             }
          }
-
-         if ((bot_cfg_fp) &&
-             (bot_cfg_pause_time >= 1.0) && (bot_cfg_pause_time <= gpGlobals->time))
+         if ((bot_cfg_fp) && (bot_cfg_pause_time >= 1.0) && (bot_cfg_pause_time <= gpGlobals->time))
          {
-            // process HPB_bot.cfg file options...
             ProcessBotCfgFile();
          }
-
       }      
 
-      // check if time to see if a bot needs to be created...
       if (bot_check_time < gpGlobals->time)
       {
-         int count = 0;
-
+         int ct_add = 0; // Renamed to avoid conflict
          bot_check_time = gpGlobals->time + 5.0;
-
-         for (i = 0; i < 32; i++)
-         {
-            if (clients[i] != NULL)
-               count++;
-         }
-
-         // if there are currently less than the maximum number of "players"
-         // then add another bot using the default skill level...
-         if ((count < max_bots) && (max_bots != -1))
-         {
-            BotCreate( NULL, NULL, NULL, NULL, NULL, NULL );
-         }
+         for (int k_add=0; k_add<32; k_add++) if(clients[k_add]!=NULL) ct_add++; // Renamed k
+         if ((ct_add < max_bots) && (max_bots != -1)) BotCreate(NULL,NULL,NULL,NULL,NULL,NULL);
       }
-
       previous_time = gpGlobals->time;
    }
-
    RETURN_META (MRES_IGNORED);
 }
 

@@ -19,6 +19,7 @@
 #include "bot_func.h"
 #include "bot_client.h"
 #include "bot_weapons.h"
+#include "bot_objective_discovery.h" // For AddGameEvent
 
 // types of damage to ignore...
 #define IGNORE_DAMAGE (DMG_CRUSH | DMG_BURN | DMG_FREEZE | DMG_FALL | \
@@ -770,11 +771,12 @@ void BotClient_CS_Money(void *p, int bot_index)
 void BotClient_Valve_DeathMsg(void *p, int bot_index)
 {
    static int state = 0;   // current state machine state
-   static int killer_index;
-   static int victim_index;
+   static int killer_idx_parsed; // Renamed to avoid conflict with local 'index'
+   static int victim_idx_parsed; // Renamed to avoid conflict
    static edict_t *killer_edict;
    static edict_t *victim_edict;
-   static int index;
+   static int index; // Used for bot_t array indexing
+   char weapon_name_parsed[64]; // To store parsed weapon name
 
    char chat_text[81];
    char chat_name[64];
@@ -784,19 +786,30 @@ void BotClient_Valve_DeathMsg(void *p, int bot_index)
    if (state == 0)
    {
       state++;
-      killer_index = *(int *)p;  // ENTINDEX() of killer
+      killer_idx_parsed = *(int *)p;  // ENTINDEX() of killer
    }
    else if (state == 1)
    {
       state++;
-      victim_index = *(int *)p;  // ENTINDEX() of victim
+      victim_idx_parsed = *(int *)p;  // ENTINDEX() of victim
    }
    else if (state == 2)
    {
       state = 0;
+      strncpy(weapon_name_parsed, (char*)p, sizeof(weapon_name_parsed)-1); // weapon name
+      weapon_name_parsed[sizeof(weapon_name_parsed)-1] = '\0';
 
-      killer_edict = INDEXENT(killer_index);
-      victim_edict = INDEXENT(victim_index);
+      killer_edict = INDEXENT(killer_idx_parsed);
+      victim_edict = INDEXENT(victim_idx_parsed);
+
+      // Log game event for player death
+      int killer_team_id = (killer_edict && killer_edict->v.team) ? killer_edict->v.team : -1; // Assuming v.team is reliable
+      int victim_team_id = (victim_edict && victim_edict->v.team) ? victim_edict->v.team : -1;
+      if (victim_edict) { // Only log if victim is valid
+         AddGameEvent(EVENT_PLAYER_DIED_NEAR_CANDIDATE, gpGlobals->time,
+                      victim_team_id, killer_team_id, /*candidate_id=*/-1,
+                      victim_idx_parsed, /*val_float=*/0.0f, /*val_int=*/killer_idx_parsed, weapon_name_parsed);
+      }
 
       // get the bot index of the killer...
       index = UTIL_GetBotIndex(killer_edict);
@@ -943,31 +956,71 @@ void BotClient_TFC_TextMsg(void *p, int bot_index)
    }
    else if (state == 1)
    {
-      if (strcmp((char *)p, "#Sentry_finish") == 0)  // sentry gun built
+      const char* message_text = (char*)p;
+      bool event_logged = false;
+
+      if (strcmp(message_text, "#Sentry_finish") == 0)
       {
          bots[bot_index].sentrygun_level = 1;
+         // Potentially log EVENT_CANDIDATE_STATE_CHANGE if sentry guns are candidates
+         // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].sentrygun_waypoint, ENTINDEX(bots[bot_index].pEdict), 1.0f, 1, "SentryBuilt");
+         event_logged = true;
       }
-      else if (strcmp((char *)p, "#Sentry_upgrade") == 0)  // sentry gun upgraded
+      else if (strcmp(message_text, "#Sentry_upgrade") == 0)
       {
          bots[bot_index].sentrygun_level += 1;
-
-         bots[bot_index].pBotEnemy = NULL;  // don't attack it anymore
+         bots[bot_index].pBotEnemy = NULL;
          bots[bot_index].enemy_attack_count = 0;
+         // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].sentrygun_waypoint, ENTINDEX(bots[bot_index].pEdict), (float)bots[bot_index].sentrygun_level, 2, "SentryUpgraded");
+         event_logged = true;
       }
-      else if (strcmp((char *)p, "#Sentry_destroyed") == 0)  // sentry gun destroyed
+      else if (strcmp(message_text, "#Sentry_destroyed") == 0)
       {
+         // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].sentrygun_waypoint, ENTINDEX(bots[bot_index].pEdict), 0.0f, 0, "SentryDestroyed");
          bots[bot_index].sentrygun_waypoint = -1;
          bots[bot_index].sentrygun_level = 0;
+         event_logged = true;
       }
-      else if (strcmp((char *)p, "#Dispenser_finish") == 0)  // dispenser built
+      else if (strcmp(message_text, "#Dispenser_finish") == 0)
       {
          bots[bot_index].dispenser_built = 1;
+         // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].dispenser_waypoint, ENTINDEX(bots[bot_index].pEdict), 1.0f, 1, "DispenserBuilt");
+         event_logged = true;
       }
-      else if (strcmp((char *)p, "#Dispenser_destroyed") == 0)  // dispenser destroyed
+      else if (strcmp(message_text, "#Dispenser_destroyed") == 0)
       {
+         // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].dispenser_waypoint, ENTINDEX(bots[bot_index].pEdict), 0.0f, 0, "DispenserDestroyed");
          bots[bot_index].dispenser_waypoint = -1;
          bots[bot_index].dispenser_built = 0;
+         event_logged = true;
       }
+      // Example for TFC flag messages (simplified, real parsing is more complex)
+      else if (strstr(message_text, "picked up the") && strstr(message_text, "Flag!")) { // e.g. "Blue Civilian picked up the Red Flag!"
+          int team_that_took = -1; // Determine from message_text (e.g., if "Blue", then TEAM_BLUE)
+          int flag_team_id = -1; // Determine which flag (e.g. if "Red Flag", then TEAM_RED's flag)
+          // This requires more robust parsing of pMessage to extract player and team IDs.
+          // For now, just log the generic message.
+          AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, team_that_took, flag_team_id, -1, -1, 0.0f, 0, message_text);
+          event_logged = true;
+      }
+      else if (strstr(message_text, "dropped the") && strstr(message_text, "Flag!")) {
+          AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, message_text);
+          event_logged = true;
+      }
+      else if (strstr(message_text, "returned the") && strstr(message_text, "Flag!")) {
+          AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, message_text);
+          event_logged = true;
+      }
+      else if (strstr(message_text, "captured the") && strstr(message_text, "Flag!")) { // e.g., "The Red Team captured the Blue Flag!"
+          int capturing_team = -1; // Determine from message
+          int flag_captured_team_id = -1; // Determine from message
+          AddGameEvent(EVENT_SCORE_CHANGED, gpGlobals->time, capturing_team, flag_captured_team_id, -1, -1, 1.0f, 0, message_text); // Assuming score changes by 1
+          event_logged = true;
+      }
+      // Catch-all for other potentially important messages if not handled above
+      // else if (!event_logged && msg_dest == HUD_PRINTCENTER) { // Example: only log center prints not already handled
+      //    AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, message_text);
+      // }
    }
 }
 
@@ -1161,13 +1214,16 @@ void BotClient_CS_HLTV(void *p, int bot_index)
    else if (state == 1)
    {
       // new round in CS 1.6
-      if ((players == 0) && (*(int *) p == 0))
+   if ((players == 0) && (*(int *) p == 0)) // This typically means a round restart event
       {
          for (index = 0; index < 32; index++)
          {
             if (bots[index].is_used)
                BotSpawnInit (&bots[index]); // reset bots for new round
          }
+      // Log round restart as an important game message or a specific round event
+      // For now, TacticalAI_HandleRoundStateChange should be called by CS-specific round end/start messages
+      // AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, "CS Round Restart (HLTV)");
       }
    }
 }

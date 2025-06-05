@@ -10,7 +10,26 @@ typedef struct {
     char map_name[32];            // Name of the map this memory is associated with
     int num_waypoints_in_file;    // Number of waypoints saved
     int num_bot_slots_in_file;    // Number of bot slots (e.g., 32)
+    int num_discovered_objectives; // Number of discovered objectives saved
 } bot_memory_file_hdr_t;
+
+
+#include "bot_tactical_ai.h" // For ObjectiveType_e
+
+// New struct for saving discovered objectives:
+typedef struct {
+    Vector location;
+    char entity_classname[64];
+    char entity_targetname[64];
+    int unique_id; // Original unique_id (waypoint index or dynamic ID)
+
+    ObjectiveType_e learned_objective_type;
+    float confidence_score;
+
+    int positive_event_correlations;
+    int negative_event_correlations;
+} SavedDiscoveredObjective_t;
+
 
 // Structure to hold persistent data for a single bot
 typedef struct {

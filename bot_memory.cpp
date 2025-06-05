@@ -6,6 +6,7 @@
 #include "bot_memory.h" // The header created in the previous step
 #include "waypoint.h"   // For WAYPOINT, PATH, paths, waypoints, num_waypoints
 #include "bot.h"        // For bot_t, bots array
+#include "bot_objective_discovery.h" // For g_candidate_objectives, CandidateObjective_t, GetCandidateObjectiveById
 
 #include <string.h> // For strncpy, memset
 #include <stdio.h> // For FILE operations
@@ -52,6 +53,18 @@ void SaveBotMemory(const char *filename) {
     header.num_waypoints_in_file = num_waypoints;
     header.num_bot_slots_in_file = 32; // Assuming fixed size of 32 bot slots
 
+    // Count savable discovered objectives
+    header.num_discovered_objectives = 0;
+    const float MIN_CONFIDENCE_TO_SAVE_OBJECTIVE = 0.25f;
+    if (!g_candidate_objectives.empty()) { // Check if vector is not empty
+        for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
+            if (g_candidate_objectives[i].confidence_score >= MIN_CONFIDENCE_TO_SAVE_OBJECTIVE) {
+                header.num_discovered_objectives++;
+            }
+        }
+    }
+
+
     // Write the header
     if (fwrite(&header, sizeof(bot_memory_file_hdr_t), 1, fp) != 1) {
         ALERT(at_console, "ERROR: Failed to write bot memory file header to: %s\n", filename);
@@ -73,6 +86,33 @@ void SaveBotMemory(const char *filename) {
             ALERT(at_console, "ERROR: Failed to write waypoints array to: %s\n", filename);
             fclose(fp);
             return;
+        }
+    }
+
+    // Save Discovered Objectives
+    if (header.num_discovered_objectives > 0) {
+        for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
+            const CandidateObjective_t& cand = g_candidate_objectives[i];
+            if (cand.confidence_score >= MIN_CONFIDENCE_TO_SAVE_OBJECTIVE) {
+                SavedDiscoveredObjective_t saved_obj;
+                memset(&saved_obj, 0, sizeof(SavedDiscoveredObjective_t));
+                saved_obj.location = cand.location;
+                strncpy(saved_obj.entity_classname, cand.entity_classname, sizeof(saved_obj.entity_classname) - 1);
+                saved_obj.entity_classname[sizeof(saved_obj.entity_classname) -1] = '\0';
+                strncpy(saved_obj.entity_targetname, cand.entity_targetname, sizeof(saved_obj.entity_targetname) - 1);
+                saved_obj.entity_targetname[sizeof(saved_obj.entity_targetname) -1] = '\0';
+                saved_obj.unique_id = cand.unique_id;
+                saved_obj.learned_objective_type = cand.learned_objective_type;
+                saved_obj.confidence_score = cand.confidence_score;
+                saved_obj.positive_event_correlations = cand.positive_event_correlations;
+                saved_obj.negative_event_correlations = cand.negative_event_correlations;
+
+                if (fwrite(&saved_obj, sizeof(SavedDiscoveredObjective_t), 1, fp) != 1) {
+                    ALERT(at_console, "ERROR: Failed to write SavedDiscoveredObjective_t for unique_id %d\n", cand.unique_id);
+                    // Potentially break or mark file as corrupt
+                    break;
+                }
+            }
         }
     }
 
@@ -351,6 +391,54 @@ void LoadBotMemory(const char *filename) {
             }
         }
     }
+
+    // Load Discovered Objectives
+    // Ensure header.num_discovered_objectives is checked for validity if versioning is more complex
+    if (header.file_version >= 1 && header.num_discovered_objectives > 0 && header.num_discovered_objectives < (MAX_OBJECTIVES_IN_DISCOVERY_LIST * 2)) { // Sanity check
+        int loaded_count = 0;
+        for (int i = 0; i < header.num_discovered_objectives; ++i) {
+            SavedDiscoveredObjective_t saved_obj;
+            if (fread(&saved_obj, sizeof(SavedDiscoveredObjective_t), 1, fp) != 1) {
+                ALERT(at_console, "ERROR: Failed to read SavedDiscoveredObjective_t record %d\n", i);
+                break;
+            }
+
+            CandidateObjective_t* existing_cand = GetCandidateObjectiveById(saved_obj.unique_id);
+            if (existing_cand) {
+                existing_cand->learned_objective_type = saved_obj.learned_objective_type;
+                existing_cand->confidence_score = saved_obj.confidence_score;
+                existing_cand->positive_event_correlations = saved_obj.positive_event_correlations;
+                existing_cand->negative_event_correlations = saved_obj.negative_event_correlations;
+            } else {
+                if (g_candidate_objectives.size() < MAX_OBJECTIVES_IN_DISCOVERY_LIST) {
+                    CandidateObjective_t new_cand;
+                    memset(&new_cand, 0, sizeof(CandidateObjective_t));
+                    new_cand.location = saved_obj.location;
+                    strncpy(new_cand.entity_classname, saved_obj.entity_classname, sizeof(new_cand.entity_classname) - 1);
+                    new_cand.entity_classname[sizeof(new_cand.entity_classname)-1] = '\0';
+                    strncpy(new_cand.entity_targetname, saved_obj.entity_targetname, sizeof(new_cand.entity_targetname) - 1);
+                    new_cand.entity_targetname[sizeof(new_cand.entity_targetname)-1] = '\0';
+                    new_cand.unique_id = saved_obj.unique_id;
+                    new_cand.learned_objective_type = saved_obj.learned_objective_type;
+                    new_cand.confidence_score = saved_obj.confidence_score;
+                    new_cand.positive_event_correlations = saved_obj.positive_event_correlations;
+                    new_cand.negative_event_correlations = saved_obj.negative_event_correlations;
+                    new_cand.last_interacting_team = -1;
+                    new_cand.last_interaction_time = 0.0f;
+                    g_candidate_objectives.push_back(new_cand);
+
+                    if (new_cand.unique_id >= (MAX_WAYPOINTS + 1) && new_cand.unique_id >= g_dynamic_candidate_id_counter) {
+                        g_dynamic_candidate_id_counter = new_cand.unique_id + 1;
+                    }
+                    loaded_count++;
+                }
+            }
+        }
+        if (loaded_count > 0) {
+             ALERT(at_console, "Processed %d discovered objectives from bot memory.\n", loaded_count);
+        }
+    }
+
 
     fclose(fp);
     ALERT(at_console, "Bot memory loaded from %s\n", filename);
