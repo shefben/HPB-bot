@@ -276,4 +276,170 @@ void TacticalAI_UpdatePeriodicState() {
         }
     }
     // TODO: Update dynamic objective info (flag positions, capture point ownership from game entities)
+
+    // After updating team info, update summarized objectives
+    TacticalAI_UpdateSummarizedObjectiveStates(MAX_OBJECTIVES); // Or a smaller number like TOP_N_OBJECTIVES_FOR_NN
+}
+
+
+// New function to summarize top objectives
+#include <algorithm> // For std::sort
+#include "bot_objective_discovery.h" // For g_candidate_objectives, CandidateObjective_t
+
+// Need access to player edicts for is_contested logic
+extern edict_t *clients[32]; // From dll.cpp (or use INDEXENT directly if appropriate)
+
+
+// Helper compare function for sorting CandidateObjective_t pointers by confidence
+bool CompareCandidateObjectives(const CandidateObjective_t* a, const CandidateObjective_t* b) {
+    if (!a || !b) return false; // Should not happen if list is clean
+    return a->confidence_score > b->confidence_score; // Sort descending
+}
+
+void TacticalAI_UpdateSummarizedObjectiveStates(int num_objectives_to_summarize) {
+    if (g_candidate_objectives.empty()) {
+        g_tactical_state.num_valid_objectives = 0;
+        return;
+    }
+
+    std::vector<const CandidateObjective_t*> sorted_candidates;
+    for (const auto& cand : g_candidate_objectives) {
+        sorted_candidates.push_back(&cand);
+    }
+    std::sort(sorted_candidates.begin(), sorted_candidates.end(), CompareCandidateObjectives);
+
+    g_tactical_state.num_valid_objectives = 0;
+    for (int i = 0; i < sorted_candidates.size() && g_tactical_state.num_valid_objectives < num_objectives_to_summarize && g_tactical_state.num_valid_objectives < MAX_OBJECTIVES; ++i) {
+        const CandidateObjective_t* cand = sorted_candidates[i];
+        ObjectivePointStatus_t* ops = &g_tactical_state.objective_points[g_tactical_state.num_valid_objectives];
+
+        ops->id = cand->unique_id;
+        ops->type = cand->learned_objective_type; // This should be the more refined type
+        ops->position = cand->location;
+        ops->owner_team = cand->current_owner_team; // Updated by discovery/messages
+
+        // Basic is_contested logic
+        ops->is_contested = false;
+        int teams_present[MAX_TEAMS] = {0};
+        int num_teams_at_objective = 0;
+        for (int j = 1; j <= gpGlobals->maxClients; ++j) {
+            edict_t* pPlayer = INDEXENT(j);
+            if (pPlayer && !pPlayer->free && !(pPlayer->v.flags & FL_OBSERVER) && IsAlive(pPlayer)) {
+                if ((pPlayer->v.origin - cand->location).LengthSquared() < (200.0f * 200.0f)) { // 200 units radius
+                    int player_team = UTIL_GetTeam(pPlayer);
+                    if (player_team >= 0 && player_team < MAX_TEAMS) {
+                        if (teams_present[player_team] == 0) {
+                            num_teams_at_objective++;
+                        }
+                        teams_present[player_team]++;
+                    }
+                }
+            }
+        }
+        if (num_teams_at_objective > 1) { // More than one distinct team present
+             // A more robust check would consider hostility between teams present
+            ops->is_contested = true;
+        }
+
+
+        // Flag-specific status (simplified - assumes candidate data is updated by messages or more detailed discovery)
+        if (ops->type == OBJ_TYPE_FLAG || ops->type == OBJ_TYPE_FLAG_LIKE_PICKUP) {
+            // This part is tricky without direct access to live flag entities or reliable message updates
+            // For now, we can only really use what's in CandidateObjective_t or make assumptions
+            // ops->is_flag_at_home_base = ???; // Needs game-specific logic to find the actual flag entity
+            // ops->flag_carrier_team = ???;
+            // ops->flag_current_position = ???;
+            // If CandidateObjective_t had these fields directly (e.g. updated by messages), copy them.
+            // For this pass, we'll assume these are not reliably updated yet for g_tactical_state in this function
+            // and would be set by TacticalAI_OnObjectiveStateMsg.
+            // If the objective is a known waypoint with W_FL_FLAG, assume its `ops->position` is home base.
+             int waypoint_idx = cand->unique_id;
+             if (waypoint_idx >=0 && waypoint_idx < num_waypoints && (waypoints[waypoint_idx].flags & W_FL_FLAG)) {
+                // For a primary map flag, its owner_team might be its original team, or -1 if neutral pickup
+                // This is highly game-mode dependent.
+             }
+        }
+        g_tactical_state.num_valid_objectives++;
+    }
+}
+
+
+// Implementation of new TacticalAI_On* handlers
+void TacticalAI_OnScoreChanged(int team_id, int score_delta, int new_total_score) {
+    if (team_id >= 0 && team_id < MAX_TEAMS) {
+        g_tactical_state.team_scores[team_id] = new_total_score;
+    }
+    // AddGameEvent is expected to be called from bot_client.cpp for this
+}
+
+void TacticalAI_OnRoundPhaseChanged(GamePhase_e new_phase, float time_arg) {
+    g_tactical_state.current_game_phase = new_phase;
+    if (new_phase == GAME_PHASE_ROUND_ACTIVE || new_phase == GAME_PHASE_SETUP) {
+        g_tactical_state.round_time_elapsed = 0;
+        g_tactical_state.round_time_remaining = time_arg;
+    } else {
+        g_tactical_state.round_time_remaining = 0;
+    }
+    // AddGameEvent for this change is expected to be called from bot_client.cpp
+}
+
+void TacticalAI_OnObjectiveStateMsg(int objective_unique_id, ObjectiveProperty_e prop, int new_value_team, Vector new_pos_val) {
+    // Find the objective in g_tactical_state.objective_points by its unique_id (which should match cand.unique_id)
+    // This assumes TacticalAI_UpdateSummarizedObjectiveStates has recently run or will run soon to populate based on candidates.
+    // A direct update here is also possible if we iterate candidates to find the one matching objective_unique_id.
+
+    ObjectivePointStatus_t* ops = NULL;
+    for (int i = 0; i < g_tactical_state.num_valid_objectives; ++i) {
+        if (g_tactical_state.objective_points[i].id == objective_unique_id) {
+            ops = &g_tactical_state.objective_points[i];
+            break;
+        }
+    }
+    // If not found in the current summarized list, it might be a candidate not yet in top N.
+    // The primary source of truth for objective states should ideally be g_candidate_objectives,
+    // and g_tactical_state.objective_points is a snapshot.
+    // For now, we'll update g_tactical_state directly if found.
+    // A better model: this function updates g_candidate_objectives, then Summarize copies it.
+
+    CandidateObjective_t* pCand = GetCandidateObjectiveById(objective_unique_id);
+
+    if (pCand) { // Update the candidate objective first
+        switch(prop) {
+            case PROP_OWNER_TEAM:
+                pCand->current_owner_team = new_value_team;
+                break;
+            // Add cases for flag properties if CandidateObjective_t stores them directly
+            // case PROP_FLAG_CARRIER_TEAM: pCand->flag_carrier_team = new_value_team; break;
+            // case PROP_FLAG_POSITION: pCand->flag_current_position = new_pos_val; break;
+            default: break;
+        }
+    }
+
+
+    if (ops) { // If also found in the summarized list, update it too
+        switch(prop) {
+            case PROP_OWNER_TEAM:
+                ops->owner_team = new_value_team;
+                break;
+            case PROP_FLAG_CARRIER_TEAM:
+                if (ops->type == OBJ_TYPE_FLAG || ops->type == OBJ_TYPE_FLAG_LIKE_PICKUP) {
+                    ops->flag_carrier_team = new_value_team;
+                    ops->is_flag_at_home_base = (new_value_team == -1 && ops->flag_current_position == ops->position);
+                }
+                break;
+            case PROP_FLAG_POSITION:
+                 if (ops->type == OBJ_TYPE_FLAG || ops->type == OBJ_TYPE_FLAG_LIKE_PICKUP) {
+                    ops->flag_current_position = new_pos_val;
+                    ops->is_flag_at_home_base = (ops->flag_carrier_team == -1 && ops->flag_current_position == ops->position);
+                }
+                break;
+            case PROP_IS_CONTESTED:
+                ops->is_contested = (bool)new_value_team; // Using new_value_team as bool (0 or 1)
+                break;
+            case PROP_IS_ACTIVE:
+                // May need an is_active field in ObjectivePointStatus_t
+                break;
+        }
+    }
+    // AddGameEvent for this change is expected to be called from bot_client.cpp
 }

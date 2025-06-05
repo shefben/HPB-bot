@@ -20,6 +20,7 @@
 #include "bot_client.h"
 #include "bot_weapons.h"
 #include "bot_objective_discovery.h" // For AddGameEvent
+#include "bot_tactical_ai.h"       // For TacticalAI_On* event handlers
 
 // types of damage to ignore...
 #define IGNORE_DAMAGE (DMG_CRUSH | DMG_BURN | DMG_FREEZE | DMG_FALL | \
@@ -942,6 +943,10 @@ void BotClient_TFC_TextMsg(void *p, int bot_index)
 {
    static int state = 0;   // current state machine state
    static int msg_dest = 0;
+   // Assuming TEAM_RED, TEAM_BLUE, etc are defined, or use mod-specific logic
+   // For TFC, team is often 1 (Blue) or 2 (Red)
+   // int TEAM_BLUE_TFC = 1;
+   // int TEAM_RED_TFC = 2;
 
    if (p == NULL)  // handle pfnMessageEnd case
    {
@@ -957,14 +962,44 @@ void BotClient_TFC_TextMsg(void *p, int bot_index)
    else if (state == 1)
    {
       const char* message_text = (char*)p;
-      bool event_logged = false;
+      bool event_logged_for_discovery = false; // Flag if AddGameEvent was called
+      bool tactical_event_handled = false; // Flag if a TacticalAI_On* was called
+
+      // Example: "The Blue Team has scored!" (hypothetical message)
+      if (strstr(message_text, "Team has scored!")) {
+          int team_id = -1;
+          int new_score = -1; // May need to get current score + delta if msg doesn't provide total
+          // TODO: Parse team_id and new_score from message_text
+          // Example: if (strstr(message_text, "Blue")) team_id = TEAM_BLUE_TFC; else if (strstr(message_text, "Red")) team_id = TEAM_RED_TFC;
+          // For now, let's assume a hypothetical score update:
+          // if (team_id != -1) {
+          //    TacticalAI_OnScoreChanged(team_id, 1, g_tactical_state.team_scores[team_id] + 1); // Assuming delta 1
+          //    AddGameEvent(EVENT_SCORE_CHANGED, gpGlobals->time, team_id, -1, -1, -1, 1.0f, g_tactical_state.team_scores[team_id] + 1, message_text);
+          //    event_logged_for_discovery = true;
+          //    tactical_event_handled = true;
+          // }
+      }
+      // Example: "Round Over. Red Team Wins."
+      else if (strstr(message_text, "Round Over") && strstr(message_text, "Team Wins")) {
+          int winning_team_id = -1;
+          // TODO: Parse winning_team_id
+          // if (strstr(message_text, "Red")) winning_team_id = TEAM_RED_TFC; else if (strstr(message_text, "Blue")) winning_team_id = TEAM_BLUE_TFC;
+          // if (winning_team_id != -1) {
+          //    TacticalAI_OnRoundPhaseChanged(GAME_PHASE_POST_ROUND, 0.0f);
+          //    AddGameEvent(EVENT_ROUND_OUTCOME, gpGlobals->time, winning_team_id, -1, -1, -1, 0.0f, 1, message_text);
+          //    event_logged_for_discovery = true;
+          //    tactical_event_handled = true;
+          // }
+      }
+
 
       if (strcmp(message_text, "#Sentry_finish") == 0)
       {
          bots[bot_index].sentrygun_level = 1;
          // Potentially log EVENT_CANDIDATE_STATE_CHANGE if sentry guns are candidates
          // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].sentrygun_waypoint, ENTINDEX(bots[bot_index].pEdict), 1.0f, 1, "SentryBuilt");
-         event_logged = true;
+         event_logged_for_discovery = true;
+         tactical_event_handled = true; // Assuming this implies a candidate state change we might track
       }
       else if (strcmp(message_text, "#Sentry_upgrade") == 0)
       {
@@ -972,55 +1007,61 @@ void BotClient_TFC_TextMsg(void *p, int bot_index)
          bots[bot_index].pBotEnemy = NULL;
          bots[bot_index].enemy_attack_count = 0;
          // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].sentrygun_waypoint, ENTINDEX(bots[bot_index].pEdict), (float)bots[bot_index].sentrygun_level, 2, "SentryUpgraded");
-         event_logged = true;
+         event_logged_for_discovery = true;
+         tactical_event_handled = true;
       }
       else if (strcmp(message_text, "#Sentry_destroyed") == 0)
       {
          // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].sentrygun_waypoint, ENTINDEX(bots[bot_index].pEdict), 0.0f, 0, "SentryDestroyed");
          bots[bot_index].sentrygun_waypoint = -1;
          bots[bot_index].sentrygun_level = 0;
-         event_logged = true;
+         event_logged_for_discovery = true;
+         tactical_event_handled = true;
       }
       else if (strcmp(message_text, "#Dispenser_finish") == 0)
       {
          bots[bot_index].dispenser_built = 1;
          // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].dispenser_waypoint, ENTINDEX(bots[bot_index].pEdict), 1.0f, 1, "DispenserBuilt");
-         event_logged = true;
+         event_logged_for_discovery = true;
+         tactical_event_handled = true;
       }
       else if (strcmp(message_text, "#Dispenser_destroyed") == 0)
       {
          // AddGameEvent(EVENT_CANDIDATE_STATE_CHANGE, gpGlobals->time, bots[bot_index].bot_team, -1, bots[bot_index].dispenser_waypoint, ENTINDEX(bots[bot_index].pEdict), 0.0f, 0, "DispenserDestroyed");
          bots[bot_index].dispenser_waypoint = -1;
          bots[bot_index].dispenser_built = 0;
-         event_logged = true;
+         event_logged_for_discovery = true;
+         tactical_event_handled = true;
       }
-      // Example for TFC flag messages (simplified, real parsing is more complex)
-      else if (strstr(message_text, "picked up the") && strstr(message_text, "Flag!")) { // e.g. "Blue Civilian picked up the Red Flag!"
-          int team_that_took = -1; // Determine from message_text (e.g., if "Blue", then TEAM_BLUE)
-          int flag_team_id = -1; // Determine which flag (e.g. if "Red Flag", then TEAM_RED's flag)
-          // This requires more robust parsing of pMessage to extract player and team IDs.
-          // For now, just log the generic message.
-          AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, team_that_took, flag_team_id, -1, -1, 0.0f, 0, message_text);
-          event_logged = true;
+      else if (strstr(message_text, "picked up the") && strstr(message_text, "Flag!")) {
+          // TODO: Parse team who took, and which flag was taken (e.g. cand.unique_id)
+          // TacticalAI_OnObjectiveStateMsg(flag_unique_id, PROP_FLAG_CARRIER_TEAM, team_who_took, flag_new_pos);
+          // AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, team_who_took, -1, flag_unique_id, player_idx, 0.0f, 0, message_text);
+          // event_logged_for_discovery = true; tactical_event_handled = true;
       }
       else if (strstr(message_text, "dropped the") && strstr(message_text, "Flag!")) {
-          AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, message_text);
-          event_logged = true;
+          // TacticalAI_OnObjectiveStateMsg(flag_unique_id, PROP_FLAG_CARRIER_TEAM, -1, flag_new_pos);
+          // AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, flag_unique_id, player_idx, 0.0f, 0, message_text);
+          // event_logged_for_discovery = true; tactical_event_handled = true;
       }
       else if (strstr(message_text, "returned the") && strstr(message_text, "Flag!")) {
-          AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, message_text);
-          event_logged = true;
+          // TacticalAI_OnObjectiveStateMsg(flag_unique_id, PROP_FLAG_CARRIER_TEAM, -1, flag_home_pos);
+          // TacticalAI_OnObjectiveStateMsg(flag_unique_id, PROP_OWNER_TEAM, original_flag_owner_team_id, flag_home_pos);
+          // AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, team_who_returned, -1, flag_unique_id, player_idx, 0.0f, 0, message_text);
+          // event_logged_for_discovery = true; tactical_event_handled = true;
       }
-      else if (strstr(message_text, "captured the") && strstr(message_text, "Flag!")) { // e.g., "The Red Team captured the Blue Flag!"
-          int capturing_team = -1; // Determine from message
-          int flag_captured_team_id = -1; // Determine from message
-          AddGameEvent(EVENT_SCORE_CHANGED, gpGlobals->time, capturing_team, flag_captured_team_id, -1, -1, 1.0f, 0, message_text); // Assuming score changes by 1
-          event_logged = true;
+      else if (strstr(message_text, "captured the") && strstr(message_text, "Flag!")) {
+          // TacticalAI_OnScoreChanged(...);
+          // TacticalAI_OnObjectiveStateMsg(flag_unique_id, PROP_FLAG_CARRIER_TEAM, -1, flag_home_pos); // Flag resets
+          // AddGameEvent(EVENT_SCORE_CHANGED, gpGlobals->time, capturing_team, -1, -1, player_idx, 1.0f, new_score, message_text);
+          // event_logged_for_discovery = true; tactical_event_handled = true;
       }
-      // Catch-all for other potentially important messages if not handled above
-      // else if (!event_logged && msg_dest == HUD_PRINTCENTER) { // Example: only log center prints not already handled
-      //    AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, message_text);
-      // }
+
+      // Generic important message logging if not handled by a specific TacticalAI_On* call yet,
+      // but still useful for objective discovery.
+      if (!tactical_event_handled && !event_logged_for_discovery && msg_dest == HUD_PRINTCENTER) {
+         // AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, message_text);
+      }
    }
 }
 
@@ -1076,9 +1117,14 @@ void BotClient_FLF_WarmUpAll(void *p, int bot_index)
 // This message gets sent when the round is over
 void BotClient_FLF_WinMessage(void *p, int bot_index)
 {
+    // Example: Extract winning team if possible from p (message content)
+    // int winning_team = ParseTeamFromWinMessage((const char*)p); // Hypothetical parsing
+    // TacticalAI_OnRoundPhaseChanged(GAME_PHASE_POST_ROUND, 0.0f);
+    // AddGameEvent(EVENT_ROUND_OUTCOME, gpGlobals->time, winning_team, -1, -1, -1, 0.0f, 1, (const char*)p);
+
    for (int i=0; i < 32; i++)
    {
-      if (bots[i].is_used)  // count the number of bots in use
+      if (bots[i].is_used)
          bots[i].round_end = 1;
    }
 }
@@ -1196,11 +1242,14 @@ void BotClient_HolyWars_GameMode(void *p, int bot_index)
 
 void BotClient_HolyWars_HudText(void *p, int bot_index)
 {
-   if (strncmp((char *)p, "Voting for", 10) == 0)
+   const char* message_text = (const char*)p;
+   if (strncmp(message_text, "Voting for", 10) == 0)
    {
       bots[bot_index].vote_in_progress = TRUE;
       bots[bot_index].f_vote_time = gpGlobals->time + RANDOM_LONG(2.0, 5.0);
+      // AddGameEvent(EVENT_IMPORTANT_GAME_MESSAGE, gpGlobals->time, -1, -1, -1, -1, 0.0f, 0, message_text);
    }
+   // Potentially log other important HolyWars messages here too.
 }
 
 void BotClient_CS_HLTV(void *p, int bot_index)

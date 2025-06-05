@@ -53,6 +53,14 @@ typedef enum {
     GAME_PHASE_GAME_OVER
 } GamePhase_e;
 
+typedef enum {
+    PROP_OWNER_TEAM,
+    PROP_FLAG_CARRIER_TEAM,
+    PROP_FLAG_POSITION,
+    PROP_IS_CONTESTED,
+    PROP_IS_ACTIVE
+} ObjectiveProperty_e;
+
 
 typedef struct {
     int id;                             // Waypoint index or other unique ID
@@ -115,5 +123,18 @@ typedef struct {
     // float map_control_ ನಮ್ಮ_team_vs_enemy_team_ratio; // e.g. based on territory, #objectives controlled
 
 } GlobalTacticalState_t;
+
+
+// Function Prototypes for Tactical AI System
+void TacticalAI_LevelInit();
+void TacticalAI_UpdatePeriodicState();
+void TacticalAI_UpdateSummarizedObjectiveStates(int num_objectives_to_summarize);
+const GlobalTacticalState_t& GetGlobalTacticalState();
+
+// Event Handlers to be called from bot_client.cpp or other game event hooks
+void TacticalAI_OnScoreChanged(int team_id, int score_delta, int new_total_score);
+void TacticalAI_OnRoundPhaseChanged(GamePhase_e new_phase, float time_arg);
+void TacticalAI_OnObjectiveStateMsg(int objective_unique_id, ObjectiveProperty_e prop, int new_value_team, Vector new_pos_val);
+
 
 #endif // BOT_TACTICAL_AI_H

@@ -9,6 +9,8 @@
 #ifndef BOT_H
 #define BOT_H
 
+#include "bot_neuro_evolution.h" // For TacticalNeuralNetwork_t
+
 // stuff for Win32 vs. Linux builds
 
 #ifndef _WIN32
@@ -309,6 +311,11 @@ typedef struct
    float last_objective_selection_time;   // gpGlobals->time when current objective was chosen
    bool  is_interacting_with_objective;   // Flag: bot is at objective and trying to interact
    float interaction_timer;               // Timer for interaction attempt
+
+   // NN related fields
+   TacticalNeuralNetwork_t tactical_nn;
+   bool nn_initialized;
+   float f_next_tactical_nn_eval_time;
 } bot_t;
 
 

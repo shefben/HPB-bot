@@ -7,6 +7,7 @@
 #include "waypoint.h"   // For WAYPOINT, PATH, paths, waypoints, num_waypoints
 #include "bot.h"        // For bot_t, bots array
 #include "bot_objective_discovery.h" // For g_candidate_objectives, CandidateObjective_t, GetCandidateObjectiveById
+#include "bot_neuro_evolution.h"   // For NN_FlattenWeights, NN_Initialize, and NN constants
 
 #include <string.h> // For strncpy, memset
 #include <stdio.h> // For FILE operations
@@ -106,6 +107,9 @@ void SaveBotMemory(const char *filename) {
                 saved_obj.confidence_score = cand.confidence_score;
                 saved_obj.positive_event_correlations = cand.positive_event_correlations;
                 saved_obj.negative_event_correlations = cand.negative_event_correlations;
+                // Save new fields
+                saved_obj.current_owner_team = cand.current_owner_team;
+                saved_obj.learned_activation_method = cand.learned_activation_method;
 
                 if (fwrite(&saved_obj, sizeof(SavedDiscoveredObjective_t), 1, fp) != 1) {
                     ALERT(at_console, "ERROR: Failed to write SavedDiscoveredObjective_t for unique_id %d\n", cand.unique_id);
@@ -197,11 +201,20 @@ void SaveBotMemory(const char *filename) {
 
             pbd.bot_team = current_bot->bot_team;
             pbd.bot_class = current_bot->bot_class;
+
+            // Save NN weights
+            if (current_bot->nn_initialized) {
+                pbd.has_saved_nn_weights = true;
+                NN_FlattenWeights(&current_bot->tactical_nn, pbd.tactical_nn_weights);
+            } else {
+                pbd.has_saved_nn_weights = false;
+                memset(pbd.tactical_nn_weights, 0, sizeof(pbd.tactical_nn_weights)); // Zero out if no weights
+            }
+
         } else {
-            // Zero out pbd if bot slot is not used.
-            // is_used_in_save is already false.
             memset(&pbd, 0, sizeof(persistent_bot_data_t));
-            pbd.is_used_in_save = false; // Ensure this remains false after memset
+            pbd.is_used_in_save = false;
+            pbd.has_saved_nn_weights = false; // Ensure this is false for unused slots
         }
 
         if (fwrite(&pbd, sizeof(persistent_bot_data_t), 1, fp) != 1) {
@@ -381,19 +394,27 @@ void LoadBotMemory(const char *filename) {
             // target_bot->is_used will be set by BotCreate or similar logic later.
             // The loaded data here is for personality/skill, not current 'in-game' state.
             target_bot->loaded_from_persistence = true; // Mark as loaded
+
+            // Load NN weights if available
+            if (pbd.has_saved_nn_weights) {
+                NN_Initialize(&target_bot->tactical_nn, NN_INPUT_SIZE, NN_HIDDEN_SIZE, NUM_TACTICAL_DIRECTIVES,
+                              false, /*initialize_with_random_weights=false*/
+                              pbd.tactical_nn_weights /*initial_weights_data*/);
+                target_bot->nn_initialized = true;
+            } else {
+                // If no saved weights, BotCreate will initialize it randomly
+                target_bot->nn_initialized = false;
+            }
+
         } else {
-            // If data for this slot wasn't used in save, ensure its persistence flag is false,
-            // but only if the slot isn't already in use by an active bot (which might have been created
-            // just before LoadBotMemory ran, e.g. in a very quick map change or if LoadBotMemory
-            // is called at a point where some bots might already exist).
-            if (i < 32 && !bots[i].is_used) { // Check bounds and if the slot is not already taken by an active bot
+            if (i < 32 && !bots[i].is_used) {
                  bots[i].loaded_from_persistence = false;
+                 bots[i].nn_initialized = false; // Ensure not marked as initialized if slot not used in save
             }
         }
     }
 
     // Load Discovered Objectives
-    // Ensure header.num_discovered_objectives is checked for validity if versioning is more complex
     if (header.file_version >= 1 && header.num_discovered_objectives > 0 && header.num_discovered_objectives < (MAX_OBJECTIVES_IN_DISCOVERY_LIST * 2)) { // Sanity check
         int loaded_count = 0;
         for (int i = 0; i < header.num_discovered_objectives; ++i) {
@@ -409,6 +430,9 @@ void LoadBotMemory(const char *filename) {
                 existing_cand->confidence_score = saved_obj.confidence_score;
                 existing_cand->positive_event_correlations = saved_obj.positive_event_correlations;
                 existing_cand->negative_event_correlations = saved_obj.negative_event_correlations;
+                // Load new fields
+                existing_cand->current_owner_team = saved_obj.current_owner_team;
+                existing_cand->learned_activation_method = saved_obj.learned_activation_method;
             } else {
                 if (g_candidate_objectives.size() < MAX_OBJECTIVES_IN_DISCOVERY_LIST) {
                     CandidateObjective_t new_cand;
@@ -425,6 +449,11 @@ void LoadBotMemory(const char *filename) {
                     new_cand.negative_event_correlations = saved_obj.negative_event_correlations;
                     new_cand.last_interacting_team = -1;
                     new_cand.last_interaction_time = 0.0f;
+                    // Load new fields
+                    new_cand.current_owner_team = saved_obj.current_owner_team;
+                    new_cand.learned_activation_method = saved_obj.learned_activation_method;
+                    new_cand.last_positive_correlation_update_time = 0.0f; // Reset or load if saved
+
                     g_candidate_objectives.push_back(new_cand);
 
                     if (new_cand.unique_id >= (MAX_WAYPOINTS + 1) && new_cand.unique_id >= g_dynamic_candidate_id_counter) {
@@ -434,8 +463,8 @@ void LoadBotMemory(const char *filename) {
                 }
             }
         }
-        if (loaded_count > 0) {
-             ALERT(at_console, "Processed %d discovered objectives from bot memory.\n", loaded_count);
+        if (loaded_count > 0) { // Changed from header.num_discovered_objectives to actual loaded_count
+             ALERT(at_console, "Loaded/Updated %d discovered objectives from bot memory.\n", loaded_count);
         }
     }
 

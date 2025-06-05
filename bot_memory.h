@@ -16,6 +16,7 @@ typedef struct {
 
 #include "bot_tactical_ai.h" // For ObjectiveType_e
 #include "bot_objective_discovery.h" // For ActivationMethod_e
+#include "bot_neuro_evolution.h" // For MAX_NN_WEIGHT_SIZE
 
 // New struct for saving discovered objectives:
 typedef struct {
@@ -75,6 +76,10 @@ typedef struct {
     // Add a field to indicate if this slot was in use,
     // so we know whether the loaded data is meaningful.
     bool is_used_in_save;
+
+    // NN Weights
+    bool has_saved_nn_weights;
+    float tactical_nn_weights[MAX_NN_WEIGHT_SIZE];
 
 } persistent_bot_data_t;
 
