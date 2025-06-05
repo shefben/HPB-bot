@@ -24,8 +24,24 @@
 #define CORRELATION_WINDOW_SECONDS 15.0f
 // Minimum number of total correlations before confidence score is considered somewhat stable
 #define MIN_CORRELATIONS_FOR_STABLE_CONFIDENCE 5
+#define MAX_RECENT_INTERACTORS 5 // For CandidateObjective_t recent interactors list size
+
+#define LEARNING_RATE 0.05f
+#define CONFIDENCE_DECAY_RATE 0.999f
+#define CONFIDENCE_DECAY_THRESHOLD_SECONDS 120.0f
+#define ROUND_WIN_CORRELATION_BONUS 5
+#define MIN_CONFIDENCE_THRESHOLD 0.01f
 
 #endif
+
+// Enum for Activation Method Types
+typedef enum {
+    ACT_UNKNOWN = 0,
+    ACT_TOUCH,          // Player must physically touch it
+    ACT_USE,            // Player must press +use on it
+    ACT_SHOOT_TARGET,   // Objective must be shot (e.g., a button activated by damage)
+    ACT_TIMED_AREA_PRESENCE // Player must remain in an area for a duration
+} ActivationMethod_e;
 
 // Enum for Game Event Types
 typedef enum {
@@ -56,6 +72,13 @@ typedef struct {
 
     int positive_event_correlations;    // Count of times interaction was followed by good game events for interacting team
     int negative_event_correlations;    // Count of times interaction was followed by bad game events for interacting team
+
+    // New fields for Step 1 of Phase 2:
+    int current_owner_team;                             // Team ID, -1 for neutral/unknown
+    ActivationMethod_e learned_activation_method;     // How this objective is believed to be used
+    std::vector<int> recent_interacting_player_edict_indices; // Edict indices of last N players
+    std::vector<int> recent_interacting_teams;                // Teams of last N players/interactions
+    float last_positive_correlation_update_time; // Time of last positive reinforcement for decay logic
 
 } CandidateObjective_t;
 
@@ -91,8 +114,9 @@ void AddGameEvent(GameEventType_e type, float timestamp,
                   int player_edict_idx, float val_float, int val_int, const char* message);
 CandidateObjective_t* GetCandidateObjectiveById(int unique_id);
 const char* ObjectiveTypeToString(ObjectiveType_e obj_type);
-const char* GameEventTypeToString(GameEventType_e event_type); // Stretch goal
-void ObjectiveDiscovery_DrawDebugVisuals(edict_t* pViewPlayer);   // Stretch goal
+const char* GameEventTypeToString(GameEventType_e event_type);
+void ObjectiveDiscovery_DrawDebugVisuals(edict_t* pViewPlayer);
+const char* ActivationMethodToString(ActivationMethod_e act_meth); // New prototype
 
 
 #endif // BOT_OBJECTIVE_DISCOVERY_H

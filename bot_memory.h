@@ -15,6 +15,7 @@ typedef struct {
 
 
 #include "bot_tactical_ai.h" // For ObjectiveType_e
+#include "bot_objective_discovery.h" // For ActivationMethod_e
 
 // New struct for saving discovered objectives:
 typedef struct {
@@ -28,6 +29,10 @@ typedef struct {
 
     int positive_event_correlations;
     int negative_event_correlations;
+
+    // New fields for Phase 2 Step 3
+    int current_owner_team;
+    ActivationMethod_e learned_activation_method;
 } SavedDiscoveredObjective_t;
 
 

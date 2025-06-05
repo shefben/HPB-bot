@@ -19,6 +19,7 @@
 #include "bot_func.h"
 #include "waypoint.h"
 #include "bot_weapons.h"
+#include "bot_objective_discovery.h" // For candidate objectives access
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -222,7 +223,105 @@ void BotSpawnInit( bot_t *pBot )
 
    memset(&(pBot->current_weapon), 0, sizeof(pBot->current_weapon));
    memset(&(pBot->m_rgAmmo), 0, sizeof(pBot->m_rgAmmo));
+
+   // Initialize new objective pursuit fields
+   // Unconditional reset for these transient action states
+   pBot->current_discovered_objective_id = -1;
+   pBot->current_objective_desirability = 0.0f;
+   pBot->last_objective_selection_time = 0.0f;
+   pBot->is_interacting_with_objective = false;
+   pBot->interaction_timer = 0.0f;
 }
+
+
+// NEW FUNCTION
+#define HIGH_CONFIDENCE_THRESHOLD 0.7f
+#define OBJECTIVE_SELECTION_COOLDOWN 10.0f // Seconds
+#define INTERACTION_DURATION 1.5f // Seconds to try interacting
+
+void BotSelectAndPursueDiscoveredObjective(bot_t *pBot) {
+    if (!gpGlobals || g_candidate_objectives.empty()) {
+        pBot->current_discovered_objective_id = -1;
+        return;
+    }
+
+    if (pBot->is_interacting_with_objective) {
+        return;
+    }
+
+    if ((gpGlobals->time - pBot->last_objective_selection_time) < OBJECTIVE_SELECTION_COOLDOWN && pBot->current_discovered_objective_id != -1) {
+        // Check if current objective is still valid and highly confident
+        CandidateObjective_t* currentObj = GetCandidateObjectiveById(pBot->current_discovered_objective_id);
+        if (currentObj && currentObj->confidence_score >= HIGH_CONFIDENCE_THRESHOLD * 0.9f) { // Allow slight dip
+             return;
+        }
+    }
+
+    CandidateObjective_t* best_candidate = NULL;
+    // Start with a value lower than any potential desirability, or current desirability if forcing re-evaluation soon isn't desired
+    float max_desirability = -1.0f;
+
+    // If current objective is held for too long, significantly reduce its appeal to force re-evaluation
+    if (pBot->current_discovered_objective_id != -1 && (gpGlobals->time - pBot->last_objective_selection_time) > (OBJECTIVE_SELECTION_COOLDOWN * 3.0f) ) {
+       // max_desirability can remain -1.0f, or we can get current objective's desirability and reduce it.
+       // Forcing re-selection by starting with -1.0f is simpler here.
+    } else if (pBot->current_discovered_objective_id != -1) {
+        CandidateObjective_t* currentObj = GetCandidateObjectiveById(pBot->current_discovered_objective_id);
+        if(currentObj) max_desirability = pBot->current_objective_desirability * 0.8f; // Must be better than 80% of current
+    }
+
+
+    for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
+        CandidateObjective_t* cand = &g_candidate_objectives[i];
+
+        if (cand->confidence_score < HIGH_CONFIDENCE_THRESHOLD) continue;
+
+        float desirability = cand->confidence_score;
+
+        if (cand->learned_objective_type == OBJ_TYPE_FLAG_LIKE_PICKUP || cand->learned_objective_type == OBJ_TYPE_FLAG) {
+            desirability *= 1.5f;
+        } else if (cand->learned_objective_type == OBJ_TYPE_CAPTURE_POINT) {
+            desirability *= 1.2f;
+            if (cand->current_owner_team == pBot->bot_team && cand->current_owner_team != -1) desirability *= 0.1f;
+        } else if (cand->learned_objective_type == OBJ_TYPE_PRESSABLE_BUTTON) {
+            desirability *= 0.8f;
+        }
+
+        float dist_to_cand_sq = (cand->location - pBot->pEdict->v.origin).LengthSquared();
+        if (dist_to_cand_sq < 1.0f) dist_to_cand_sq = 1.0f;
+        // desirability /= (1.0f + (sqrt(dist_to_cand_sq) / 2000.0f)); // Using sqrt for actual distance
+        // Simpler: just use squared distance for relative comparison, no sqrt needed.
+        // Favor closer objectives more strongly:
+        desirability = desirability * 10000.0f / (100.0f + dist_to_cand_sq);
+
+
+        if (desirability > max_desirability) {
+            max_desirability = desirability;
+            best_candidate = cand;
+        }
+    }
+
+    if (best_candidate) {
+        if (pBot->current_discovered_objective_id != best_candidate->unique_id) {
+            // ALERT(at_console, "Bot %s new objective: ID %d (type %s), Des: %.2f\n", pBot->name, best_candidate->unique_id, ObjectiveTypeToString(best_candidate->learned_objective_type), max_desirability);
+        }
+        pBot->current_discovered_objective_id = best_candidate->unique_id;
+        pBot->current_objective_desirability = max_desirability;
+        pBot->last_objective_selection_time = gpGlobals->time;
+
+        int waypoint_idx = WaypointFindNearest(best_candidate->location, pBot->pEdict, REACHABLE_RANGE * 2, pBot->bot_team);
+        if (waypoint_idx != -1 && waypoints[waypoint_idx].flags & W_FL_DELETED == 0) { // Ensure waypoint is not deleted
+            pBot->waypoint_goal = waypoint_idx;
+            pBot->waypoint_origin = waypoints[waypoint_idx].origin;
+        } else {
+            pBot->waypoint_goal = -1;
+            pBot->waypoint_origin = best_candidate->location;
+        }
+        pBot->f_waypoint_goal_time = gpGlobals->time + 60.0f;
+        pBot->is_interacting_with_objective = false;
+    }
+}
+// END NEW FUNCTION
 
 
 void BotNameInit( void )
@@ -1973,6 +2072,59 @@ void BotThink( bot_t *pBot )
       {
          // no enemy, let's just wander around...
 
+           // If interacting, handle that (this comes before selecting new objective)
+           if (pBot->is_interacting_with_objective) {
+               pBot->f_move_speed = 0; // Stand still while interacting
+               pBot->pEdict->v.button |= IN_USE; // Hold +use
+               if (gpGlobals->time >= pBot->interaction_timer) {
+                   pBot->is_interacting_with_objective = false; // Interaction done
+                   pBot->current_discovered_objective_id = -1; // Clear objective to allow re-evaluation
+                   pBot->current_objective_desirability = 0.0f;
+                   pBot->last_objective_selection_time = gpGlobals->time; // Allow new selection soon
+                   // ALERT(at_console, "Bot %s finished interaction attempt.\n", pBot->name);
+               }
+           }
+           // If not interacting, and not paused, then consider objectives or waypoints
+           else if (pBot->f_pause_time <= gpGlobals->time)
+           {
+               BotSelectAndPursueDiscoveredObjective(pBot); // THIS IS THE NEW CALL
+
+               // Existing waypoint logic will use pBot->waypoint_goal / pBot->waypoint_origin
+               found_waypoint = FALSE;
+               if ((pBot->pBotPickupItem == NULL) &&
+                   (pBot->f_look_for_waypoint_time <= gpGlobals->time) &&
+                   (num_waypoints != 0 || pBot->current_discovered_objective_id != -1))
+               {
+                   // Check if near current discovered objective's location
+                   if (pBot->current_discovered_objective_id != -1 && !pBot->is_interacting_with_objective) { // Don't re-check if already decided to interact this frame
+                       CandidateObjective_t* pObj = GetCandidateObjectiveById(pBot->current_discovered_objective_id);
+                       if (pObj) {
+                           float dist_sq_to_obj_loc = (pObj->location - pBot->pEdict->v.origin).LengthSquared();
+                           if (dist_sq_to_obj_loc < (64.0f * 64.0f)) { // Within 64 units
+                               if (pObj->learned_activation_method == ACT_TOUCH ||
+                                   pObj->learned_activation_method == ACT_USE ||
+                                   pObj->learned_activation_method == ACT_UNKNOWN) {
+
+                                   pBot->is_interacting_with_objective = true;
+                                   pBot->interaction_timer = gpGlobals->time + INTERACTION_DURATION;
+                                   pBot->f_move_speed = 0;
+                                   pBot->pEdict->v.button |= IN_USE;
+                                   // ALERT(at_console, "Bot %s starting interaction with obj ID %d\n", pBot->name, pObj->unique_id);
+                               } else {
+                                    pBot->current_discovered_objective_id = -1;
+                                    pBot->current_objective_desirability = 0.0f;
+                               }
+                               pBot->last_objective_selection_time = gpGlobals->time;
+                           }
+                       }
+                   }
+
+                   if (!pBot->is_interacting_with_objective) { // Only navigate if not currently interacting
+                        found_waypoint = BotHeadTowardWaypoint(pBot);
+                   } else {
+                        found_waypoint = true; // تعتبر متجهة نحو الهدف اثناء التفاعل
+                   }
+               }
             // took too long trying to spray logo?...
          if ((pBot->b_spray_logo) &&
              ((pBot->f_spray_logo_time + 3.0) < gpGlobals->time))

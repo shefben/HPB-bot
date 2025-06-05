@@ -23,13 +23,23 @@
 // Enum for Objective Types
 typedef enum {
     OBJ_TYPE_NONE = 0,
-    OBJ_TYPE_FLAG,              // Standard CTF Flag
-    OBJ_TYPE_CAPTURE_POINT,     // King of the Hill / Control Point
-    OBJ_TYPE_BOMB_TARGET,       // CS Bomb Target
-    OBJ_TYPE_RESCUE_ZONE,       // CS Hostage Rescue Zone
-    OBJ_TYPE_RESOURCE_NODE,     // A point that generates resources
-    OBJ_TYPE_STRATEGIC_LOCATION // General important location
-    // Add more as needed
+    OBJ_TYPE_FLAG,              // Original, might be too specific if we want to learn "flag-like"
+    OBJ_TYPE_CAPTURE_POINT,     // Original
+    OBJ_TYPE_BOMB_TARGET,       // Original
+    OBJ_TYPE_RESCUE_ZONE,       // Original
+    OBJ_TYPE_RESOURCE_NODE,     // Original (for health/ammo/armor packs)
+    OBJ_TYPE_STRATEGIC_LOCATION,// Original (generic important spot)
+
+    // New semantic types to be learned:
+    OBJ_TYPE_FLAG_LIKE_PICKUP,    // Something to be touched/used and "carried" or causes immediate major state change
+    OBJ_TYPE_CONTROL_AREA,        // Area where prolonged presence leads to capture/score
+    OBJ_TYPE_DESTRUCTIBLE_TARGET, // Something to be shot/damaged for an effect
+    OBJ_TYPE_HEALTH_REFILL_STATION, // Specific type for health chargers
+    OBJ_TYPE_ARMOR_REFILL_STATION,  // Specific type for HEV chargers
+    OBJ_TYPE_AMMO_REFILL_POINT,   // Could be for ammo packs if not covered by RESOURCE_NODE
+    OBJ_TYPE_PRESSABLE_BUTTON,    // func_button or similar
+    OBJ_TYPE_DOOR_OBSTACLE        // A door that needs opening to progress
+    // Add more as concepts develop
 } ObjectiveType_e;
 
 // Enum for Game Phase

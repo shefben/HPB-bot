@@ -6,6 +6,8 @@
 #include <string.h>          // For memset, strncpy
 // bot_objective_discovery.h should have included <vector> and <list>
 
+extern int m_spriteTexture; // From dll.cpp, for TE_BEAMPOINTS
+
 // Global instance of the tactical state is in bot_tactical_ai.cpp, extern if needed, or pass a pointer.
 // For now, direct use of g_tactical_state for read-only info might be okay if linked.
 // However, it's better practice to pass necessary parts of g_tactical_state or use its accessor.
@@ -85,6 +87,9 @@ void ObjectiveDiscovery_LevelInit() {
             cand.last_interaction_time = 0.0f;
             cand.positive_event_correlations = 0;
             cand.negative_event_correlations = 0;
+            cand.current_owner_team = -1;
+            cand.learned_activation_method = ACT_UNKNOWN;
+            cand.last_positive_correlation_update_time = 0.0f;
 
             g_candidate_objectives.push_back(cand);
         }
@@ -176,15 +181,34 @@ void ObjectiveDiscovery_UpdatePeriodic() {
                     cand_new.confidence_score = 0.05f;
                     cand_new.last_interacting_team = UTIL_GetTeam(pPlayer);
                     cand_new.last_interaction_time = gpGlobals->time;
+                    // Initialize new CandidateObjective_t fields
+                    cand_new.current_owner_team = -1;
+                    cand_new.learned_activation_method = ACT_UNKNOWN;
+                    cand_new.last_positive_correlation_update_time = 0.0f;
                     g_candidate_objectives.push_back(cand_new);
+                    pCand = &g_candidate_objectives.back();
                     existing_candidate_idx = cand_new.unique_id;
-                } else if (found_existing && pCand && pCand->confidence_score < 0.5f) {
-                    // Already known, but maybe update if low confidence (e.g. refresh interaction time)
-                    // This is already done when pCand is found.
                 }
 
-                if (pPlayer->v.button & IN_USE && existing_candidate_idx != -1) {
-                     AddGameEvent(EVENT_PLAYER_USED_ENTITY, gpGlobals->time, UTIL_GetTeam(pPlayer), -1, existing_candidate_idx, ENTINDEX(pPlayer), 0.0f, 0, STRING(pLookedAtEntity->v.classname));
+                if (pCand) {
+                    // Update recent interactors
+                    pCand->recent_interacting_player_edict_indices.push_back(ENTINDEX(pPlayer));
+                    if (pCand->recent_interacting_player_edict_indices.size() > MAX_RECENT_INTERACTORS) {
+                        pCand->recent_interacting_player_edict_indices.erase(pCand->recent_interacting_player_edict_indices.begin());
+                    }
+                    pCand->recent_interacting_teams.push_back(UTIL_GetTeam(pPlayer));
+                    if (pCand->recent_interacting_teams.size() > MAX_RECENT_INTERACTORS) {
+                        pCand->recent_interacting_teams.erase(pCand->recent_interacting_teams.begin());
+                    }
+
+                    // Initial heuristic for activation method
+                    if (pPlayer->v.button & IN_USE) {
+                        if (pCand->learned_activation_method == ACT_UNKNOWN) {
+                            pCand->learned_activation_method = ACT_USE;
+                        }
+                        // Log event only if candidate was valid (existing_candidate_idx set)
+                        if(existing_candidate_idx != -1) AddGameEvent(EVENT_PLAYER_USED_ENTITY, gpGlobals->time, UTIL_GetTeam(pPlayer), -1, existing_candidate_idx, ENTINDEX(pPlayer), 0.0f, 0, STRING(pLookedAtEntity->v.classname));
+                    }
                 }
             }
         }
@@ -234,14 +258,96 @@ void ObjectiveDiscovery_UpdatePeriodic() {
                     cand_new.confidence_score = 0.05f;
                     cand_new.last_interacting_team = UTIL_GetTeam(pPlayer);
                     cand_new.last_interaction_time = gpGlobals->time;
+                    // Initialize new CandidateObjective_t fields
+                    cand_new.current_owner_team = -1;
+                    cand_new.learned_activation_method = ACT_UNKNOWN;
+                    cand_new.last_positive_correlation_update_time = 0.0f;
                     g_candidate_objectives.push_back(cand_new);
-                    AddGameEvent(EVENT_PLAYER_TOUCHED_ENTITY, gpGlobals->time, UTIL_GetTeam(pPlayer), -1, cand_new.unique_id, ENTINDEX(pPlayer), 0.0f, 0, STRING(pNearbyEntity->v.classname));
+                    pCand = &g_candidate_objectives.back();
+                    AddGameEvent(EVENT_PLAYER_TOUCHED_ENTITY, gpGlobals->time, UTIL_GetTeam(pPlayer), -1, pCand->unique_id, ENTINDEX(pPlayer), 0.0f, 0, STRING(pNearbyEntity->v.classname));
+                 }
+
+                 if(pCand) {
+                    // Update recent interactors
+                    pCand->recent_interacting_player_edict_indices.push_back(ENTINDEX(pPlayer));
+                    if (pCand->recent_interacting_player_edict_indices.size() > MAX_RECENT_INTERACTORS) {
+                        pCand->recent_interacting_player_edict_indices.erase(pCand->recent_interacting_player_edict_indices.begin());
+                    }
+                    pCand->recent_interacting_teams.push_back(UTIL_GetTeam(pPlayer));
+                    if (pCand->recent_interacting_teams.size() > MAX_RECENT_INTERACTORS) {
+                        pCand->recent_interacting_teams.erase(pCand->recent_interacting_teams.begin());
+                    }
+                    // Initial heuristic for activation method (touch)
+                    if (pCand->learned_activation_method == ACT_UNKNOWN) {
+                        pCand->learned_activation_method = ACT_TOUCH;
+                    }
                  }
             }
         }
     }
     // TODO: Update state of existing candidates if possible (e.g. door open/closed).
 }
+
+
+// Helper function for keyword spotting - very basic example
+bool MessageContainsKeyword(const char* message, const char* keyword) {
+    if (!message || !keyword) return false;
+    return strstr(message, keyword) != NULL;
+}
+
+void ObjectiveDiscovery_UpdateLearnedTypes() {
+    if (!gpGlobals) return;
+    const float SEMANTIC_TYPING_CONFIDENCE_THRESHOLD = 0.6f;
+
+    for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
+        CandidateObjective_t& cand = g_candidate_objectives[i];
+
+        if (cand.confidence_score < SEMANTIC_TYPING_CONFIDENCE_THRESHOLD) {
+            // Optional: Revert to a less specific type if confidence drops.
+            // if (cand.learned_objective_type != OBJ_TYPE_STRATEGIC_LOCATION && cand.learned_objective_type != OBJ_TYPE_NONE) {
+            //    cand.learned_objective_type = OBJ_TYPE_STRATEGIC_LOCATION;
+            // }
+            continue;
+        }
+
+        // Heuristic 1: Based on learned_activation_method and waypoint flags
+        if (cand.learned_activation_method == ACT_TOUCH || cand.learned_activation_method == ACT_USE) {
+            if (cand.positive_event_correlations > cand.negative_event_correlations + 5 &&
+                (cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE || cand.learned_objective_type == OBJ_TYPE_FLAG)) {
+                int waypoint_idx = cand.unique_id; // Assuming unique_id is waypoint index for waypoint-derived candidates
+                if (waypoint_idx >=0 && waypoint_idx < num_waypoints && (waypoints[waypoint_idx].flags & W_FL_FLAG) ) {
+                     cand.learned_objective_type = OBJ_TYPE_FLAG; // More specific than FLAG_LIKE_PICKUP if from actual flag waypoint
+                } else if (cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE) {
+                     cand.learned_objective_type = OBJ_TYPE_FLAG_LIKE_PICKUP;
+                }
+            }
+        }
+
+        // Heuristic 2: Based on entity_classname
+        if (strlen(cand.entity_classname) > 0) {
+            if (strcmp(cand.entity_classname, "func_healthcharger") == 0) {
+                cand.learned_objective_type = OBJ_TYPE_HEALTH_REFILL_STATION;
+            } else if (strcmp(cand.entity_classname, "func_recharge") == 0) {
+                cand.learned_objective_type = OBJ_TYPE_ARMOR_REFILL_STATION;
+            } else if (strncmp(cand.entity_classname, "ammo_", 5) == 0) {
+                cand.learned_objective_type = OBJ_TYPE_AMMO_REFILL_POINT;
+            } else if (strcmp(cand.entity_classname, "item_healthkit")==0 || strcmp(cand.entity_classname, "item_battery")==0){
+                cand.learned_objective_type = OBJ_TYPE_RESOURCE_NODE; // Generalize item pickups
+            } else if (strcmp(cand.entity_classname, "func_button") == 0) {
+                cand.learned_objective_type = OBJ_TYPE_PRESSABLE_BUTTON;
+                if (cand.learned_activation_method == ACT_UNKNOWN) cand.learned_activation_method = ACT_USE;
+            } else if (strncmp(cand.entity_classname, "func_door", 9) == 0 || strcmp(cand.entity_classname, "momentary_door") == 0) {
+                cand.learned_objective_type = OBJ_TYPE_DOOR_OBSTACLE;
+            }
+        }
+
+        // Fallback for high confidence but no specific type yet
+        if (cand.learned_objective_type == OBJ_TYPE_NONE && cand.confidence_score > SEMANTIC_TYPING_CONFIDENCE_THRESHOLD) {
+            cand.learned_objective_type = OBJ_TYPE_STRATEGIC_LOCATION;
+        }
+    }
+}
+
 
 void ObjectiveDiscovery_AnalyzeEvents() {
     if (!gpGlobals) return;
@@ -254,8 +360,9 @@ void ObjectiveDiscovery_AnalyzeEvents() {
     }
 
     std::list<GameEvent_t>::iterator current_event_it = g_game_event_log.begin();
-    // Simplified full scan for this pass; in future, use g_last_processed_event_it
-    // to only process new events.
+    // For true incremental processing, g_last_processed_event_it would be used carefully.
+    // The current loop iterates all events, which is fine for now but less optimal.
+    // If g_last_processed_event_it was used, it should be the starting point for current_event_it.
 
     for (current_event_it = g_game_event_log.begin(); current_event_it != g_game_event_log.end(); ++current_event_it) {
         GameEvent_t& outcome_event = *current_event_it;
@@ -263,12 +370,17 @@ void ObjectiveDiscovery_AnalyzeEvents() {
         if (outcome_event.type == EVENT_SCORE_CHANGED || outcome_event.type == EVENT_ROUND_OUTCOME) {
             int benefiting_team = outcome_event.primarily_involved_team_id;
             bool positive_outcome_for_team = false;
+            bool negative_outcome_for_team = false;
 
-            if (outcome_event.type == EVENT_SCORE_CHANGED && outcome_event.event_value_float > 0) {
-                positive_outcome_for_team = true;
-            } else if (outcome_event.type == EVENT_ROUND_OUTCOME && outcome_event.event_value_int == 1) { // 1 for win
-                positive_outcome_for_team = true;
+            if (outcome_event.type == EVENT_SCORE_CHANGED) {
+                if (outcome_event.event_value_float > 0) positive_outcome_for_team = true;
+                else if (outcome_event.event_value_float < 0) negative_outcome_for_team = true;
+            } else if (outcome_event.type == EVENT_ROUND_OUTCOME) {
+                if (outcome_event.event_value_int == 1) positive_outcome_for_team = true;
+                else if (outcome_event.event_value_int == -1) negative_outcome_for_team = true;
             }
+
+            if (!positive_outcome_for_team && !negative_outcome_for_team) continue;
 
             std::list<GameEvent_t>::reverse_iterator interaction_it(current_event_it);
 
@@ -285,30 +397,36 @@ void ObjectiveDiscovery_AnalyzeEvents() {
 
                     CandidateObjective_t* pCandidate = GetCandidateObjectiveById(interaction_event.candidate_objective_id);
                     if (pCandidate) {
+                        int correlation_increment = 1;
+                        if (outcome_event.type == EVENT_ROUND_OUTCOME && positive_outcome_for_team) {
+                           correlation_increment += ROUND_WIN_CORRELATION_BONUS;
+                        }
+
                         if (positive_outcome_for_team) {
-                            pCandidate->positive_event_correlations++;
-                        } else {
-                            if ((outcome_event.type == EVENT_SCORE_CHANGED && outcome_event.event_value_float < 0) ||
-                                (outcome_event.type == EVENT_ROUND_OUTCOME && outcome_event.event_value_int == -1)) {
-                                pCandidate->negative_event_correlations++;
-                            }
+                            pCandidate->positive_event_correlations += correlation_increment;
+                            pCandidate->last_positive_correlation_update_time = gpGlobals->time;
+                            pCandidate->confidence_score += LEARNING_RATE * (1.0f - pCandidate->confidence_score);
+                        } else if (negative_outcome_for_team) {
+                            pCandidate->negative_event_correlations += correlation_increment;
+                            pCandidate->confidence_score += LEARNING_RATE * (0.0f - pCandidate->confidence_score);
                         }
 
-                        float total_correlations = (float)(pCandidate->positive_event_correlations + pCandidate->negative_event_correlations);
-                        if (total_correlations > 0) {
-                            pCandidate->confidence_score = (float)pCandidate->positive_event_correlations / total_correlations;
-                        } else {
-                            pCandidate->confidence_score = 0.1f;
-                        }
-
-                        if (total_correlations < MIN_CORRELATIONS_FOR_STABLE_CONFIDENCE) {
-                            if (pCandidate->confidence_score > 0.75f) pCandidate->confidence_score = 0.75f;
-                             else if (pCandidate->confidence_score < 0.25f && pCandidate->positive_event_correlations == 0 && total_correlations > 1) pCandidate->confidence_score = 0.25f; // avoid going too low too fast
-                        }
                         if (pCandidate->confidence_score > 0.95f) pCandidate->confidence_score = 0.95f;
-                        if (pCandidate->confidence_score < 0.01f && total_correlations >= MIN_CORRELATIONS_FOR_STABLE_CONFIDENCE) pCandidate->confidence_score = 0.01f; // floor it
+                        if (pCandidate->confidence_score < MIN_CONFIDENCE_THRESHOLD) pCandidate->confidence_score = MIN_CONFIDENCE_THRESHOLD;
                     }
                 }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
+        CandidateObjective_t& cand = g_candidate_objectives[i];
+        if (cand.last_positive_correlation_update_time > 0.0f &&
+            (gpGlobals->time - cand.last_positive_correlation_update_time > CONFIDENCE_DECAY_THRESHOLD_SECONDS)) {
+
+            cand.confidence_score *= CONFIDENCE_DECAY_RATE;
+            if (cand.confidence_score < MIN_CONFIDENCE_THRESHOLD) {
+                cand.confidence_score = MIN_CONFIDENCE_THRESHOLD;
             }
         }
     }
@@ -354,15 +472,34 @@ void ObjectiveDiscovery_DrawDebugVisuals(edict_t* pViewPlayer) {
     // This would require access to engine functions for drawing text or beams (e.g., from util_ebot.h if that's where they are)
     // For now, just an ALERT as a placeholder for where drawing calls would go.
     /*
+    extern int m_spriteTexture; // From dll.cpp, for TE_BEAMPOINTS - ensure this is declared if used
+
     for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
         const CandidateObjective_t& cand = g_candidate_objectives[i];
-        if (cand.confidence_score > 0.1f) { // Only draw somewhat confident candidates
-            // Simplified: print to console instead of drawing in world
-            //char text_to_draw[128];
-            //sprintf(text_to_draw, "Cand ID %d: %s (Conf: %.2f)", cand.unique_id, ObjectiveTypeToString(cand.learned_objective_type), cand.confidence_score);
-            // Draw text_to_draw at cand.location in the world for pViewPlayer
-            // Example: ALERT(at_console, "DebugDraw: %s\n", text_to_draw);
+        if (cand.confidence_score < DEBUG_DRAW_CONFIDENCE_THRESHOLD) {
+            continue;
         }
+        if ((cand.location - pViewPlayer->v.origin).LengthSquared() > DEBUG_DRAW_MAX_DISTANCE_SQ) {
+            continue;
+        }
+
+        int r = 0, g = 0, b = 0;
+        if (cand.confidence_score > 0.7f) { g = 255; }
+        else if (cand.confidence_score > 0.4f) { r = 255; g = 255; b = 0; }
+        else { r = 255; }
+
+        Vector vecStart = cand.location + Vector(0,0,10);
+        Vector vecEnd = cand.location + Vector(0,0,74);
+
+        MESSAGE_BEGIN(MSG_ONE, SVC_TEMPENTITY, NULL, pViewPlayer);
+            WRITE_BYTE(TE_BEAMPOINTS);
+            WRITE_COORD(vecStart.x); WRITE_COORD(vecStart.y); WRITE_COORD(vecStart.z);
+            WRITE_COORD(vecEnd.x); WRITE_COORD(vecEnd.y); WRITE_COORD(vecEnd.z);
+            WRITE_SHORT(m_spriteTexture);
+            WRITE_BYTE(0); WRITE_BYTE(10); WRITE_BYTE(3); WRITE_BYTE(20); WRITE_BYTE(0);
+            WRITE_BYTE(r); WRITE_BYTE(g); WRITE_BYTE(b);
+            WRITE_BYTE(200); WRITE_BYTE(5);
+        MESSAGE_END();
     }
     */
 }

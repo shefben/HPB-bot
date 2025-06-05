@@ -302,6 +302,13 @@ typedef struct
    int m_rgAmmo[MAX_AMMO_SLOTS];  // total ammo amounts (1 array for each bot)
 
    bool loaded_from_persistence; // True if this bot's persistent fields were populated by LoadBotMemory
+
+   // Fields for discovered objective pursuit
+   int current_discovered_objective_id;     // unique_id of CandidateObjective_t bot is pursuing
+   float current_objective_desirability;    // Cached desirability of this objective
+   float last_objective_selection_time;   // gpGlobals->time when current objective was chosen
+   bool  is_interacting_with_objective;   // Flag: bot is at objective and trying to interact
+   float interaction_timer;               // Timer for interaction attempt
 } bot_t;
 
 
