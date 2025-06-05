@@ -207,5 +207,47 @@ const float TACTICAL_NN_EVAL_INTERVAL = 3.0f; // Seconds
 
 #endif // BOT_NN_CONSTANTS_H
 
+#ifndef BOT_EA_CONSTANTS_H
+#define BOT_EA_CONSTANTS_H
+
+const float NE_MUTATION_RATE = 0.05f;          // Probability of each weight mutating
+const float NE_MUTATION_STRENGTH = 0.1f;       // Max +/- change for a weight during mutation
+const int NE_NUM_ELITES_TO_KEEP = 2;           // Number of best individuals to carry over directly
+const int NE_TOURNAMENT_SIZE = 3;              // Number of individuals in a tournament selection round
+
+#endif // BOT_EA_CONSTANTS_H
+
+#ifndef BOT_EA_CYCLE_CONSTANTS_H
+#define BOT_EA_CYCLE_CONSTANTS_H
+
+const float NE_GENERATION_EVALUATION_PERIOD_SECONDS = 180.0f; // Example: 3 minutes per generation
+const int NE_MIN_POPULATION_FOR_EVOLUTION = 4; // Minimum bots needed to run evolution (e.g., elites + at least one pair for crossover)
+
+#endif // BOT_EA_CYCLE_CONSTANTS_H
+
+
+// Forward declare bot_t for NE_Selection_Tournament parameter
+// Forward declare GlobalTacticalState_t for NE_PerformEvolutionaryCycle and NE_CalculateFinalFitness
+struct bot_t;
+struct GlobalTacticalState_t; // Already included via bot_tactical_ai.h, but good for clarity
+struct GameEvent_t; // For NE_UpdateFitnessStatsOnEvent
+
+// EA Function Prototypes
+void NE_ResetBotFitnessStats(bot_t* pBot);
+void NE_UpdateFitnessStatsOnEvent(bot_t* pBot, GameEventType_e event_type, const GameEvent_t* event_data);
+float NE_CalculateFinalFitness(bot_t* pBot, const GlobalTacticalState_t* current_tactical_state); // Added current_tactical_state
+
+void NE_Selection_Tournament(const std::vector<bot_t*>& current_population_bots,
+                             int tournament_k_size,
+                             std::vector<const TacticalNeuralNetwork_t*>& selected_parents_nns);
+void NE_Crossover_SinglePoint(const TacticalNeuralNetwork_t* nn_parent1,
+                              const TacticalNeuralNetwork_t* nn_parent2,
+                              TacticalNeuralNetwork_t* nn_offspring1,
+                              TacticalNeuralNetwork_t* nn_offspring2);
+void NE_Mutation(TacticalNeuralNetwork_t* nn, float mutation_rate, float mutation_strength);
+
+void NE_PerformEvolutionaryCycle(std::vector<bot_t*>& current_population_bots,
+                                 const GlobalTacticalState_t* current_tactical_state);
+
 
 #endif // BOT_NEURO_EVOLUTION_H

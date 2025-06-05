@@ -15,12 +15,13 @@
 #include <h_export.h>
 #include <meta_api.h>
 
-#include "bot.h" // Already includes bot_neuro_evolution.h
+#include "bot.h"
 #include "bot_func.h"
 #include "waypoint.h"
 #include "bot_weapons.h"
 #include "bot_objective_discovery.h"
 #include "bot_tactical_ai.h"
+#include "bot_neuro_evolution.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -47,7 +48,7 @@ extern edict_t *pent_info_ctfdetect;
 extern int bot_reaction_time;
 extern int IsDedicatedServer;
 extern int holywars_gamemode;
-extern edict_t *listenserver_edict; // For logging to listen server console
+extern edict_t *listenserver_edict;
 
 
 extern int max_team_players[4];
@@ -66,7 +67,6 @@ extern bool is_team_play;
 extern int number_skins;
 extern skin_t bot_skins[MAX_SKINS];
 
-// Access to global tactical state (defined in bot_tactical_ai.cpp)
 extern GlobalTacticalState_t g_tactical_state;
 
 
@@ -86,7 +86,7 @@ char bot_names[MAX_BOT_NAMES][BOT_NAME_LEN+1];
 int num_logos = 0;
 char bot_logos[MAX_BOT_LOGOS][16];
 
-bot_t bots[32];   // max of 32 bots in a game
+bot_t bots[32];
 bool b_observer_mode = FALSE;
 bool b_botdontshoot = FALSE;
 
@@ -210,6 +210,15 @@ void BotSpawnInit( bot_t *pBot )
    pBot->interaction_timer = 0.0f;
 
    pBot->f_next_tactical_nn_eval_time = gpGlobals->time + (TACTICAL_NN_EVAL_INTERVAL / 2.0f) + RANDOM_FLOAT(0, TACTICAL_NN_EVAL_INTERVAL / 2.0f);
+
+   // Reset fitness stats for the new spawn/evaluation period
+   pBot->current_eval_score_contribution = 0.0f;
+   pBot->current_eval_objectives_captured_or_defended = 0;
+   pBot->current_eval_kills = 0;
+   pBot->current_eval_deaths = 0;
+   pBot->current_eval_damage_dealt = 0.0f;
+   pBot->current_eval_survival_start_time = gpGlobals->time;
+   pBot->last_chosen_directive_for_fitness_eval = NUM_TACTICAL_DIRECTIVES; // A default/invalid state
 }
 
 
@@ -230,7 +239,8 @@ void PrepareNNInputs(bot_t *pBot, float* nn_input_array) {
         if (max_round_time_estimate <= 0.001f) max_round_time_estimate = 180.0f;
         nn_input_array[current_idx++] = ts.round_time_remaining / max_round_time_estimate;
     } else if (ts.round_time_elapsed >= 0) {
-         nn_input_array[current_idx++] = (1.0f - (ts.round_time_elapsed / max_round_time_estimate) > 0 ? (1.0f - (ts.round_time_elapsed / max_round_time_estimate)) : 0.0f);
+         float normalized_elapsed = ts.round_time_elapsed / max_round_time_estimate;
+         nn_input_array[current_idx++] = (1.0f - normalized_elapsed > 0.0f ? (1.0f - normalized_elapsed) : 0.0f);
     } else {
         nn_input_array[current_idx++] = 0.5f;
     }
@@ -887,12 +897,17 @@ void BotCreate( edict_t *pPlayer, const char *arg1, const char *arg2,
       pBot->f_strafe_direction = 0.0;  // not strafing
       pBot->f_strafe_time = 0.0;
 
-      pBot->nn_initialized = false;
-      // Initialize NN with random weights for newly created bot
-      // This might be overwritten if LoadBotMemory has persistent NN weights for this slot later
-      NN_Initialize(&pBot->tactical_nn, NN_INPUT_SIZE, NN_HIDDEN_SIZE, NUM_TACTICAL_DIRECTIVES, true, NULL);
-      pBot->nn_initialized = true;
-      pBot->f_next_tactical_nn_eval_time = gpGlobals->time + TACTICAL_NN_EVAL_INTERVAL + RANDOM_FLOAT(0,1.5f); // Stagger initial
+      // NN Initialization:
+      // If LoadBotMemory already initialized it with saved weights, pBot->nn_initialized will be true.
+      // Otherwise, initialize with random weights.
+      if (!pBot->nn_initialized) {
+          NN_Initialize(&pBot->tactical_nn, NN_INPUT_SIZE, NN_HIDDEN_SIZE, NUM_TACTICAL_DIRECTIVES,
+                        true,  // initialize_with_random_weights = true
+                        NULL); // initial_weights_data = NULL
+          pBot->nn_initialized = true;
+      }
+      // f_next_tactical_nn_eval_time is set in BotSpawnInit, but set here too for first creation before first spawn
+      pBot->f_next_tactical_nn_eval_time = gpGlobals->time + TACTICAL_NN_EVAL_INTERVAL + RANDOM_FLOAT(0,1.5f);
 
 
       pBot->f_start_vote_time = gpGlobals->time + RANDOM_LONG(120, 600);
@@ -1753,6 +1768,7 @@ void BotThink( bot_t *pBot )
        NN_FeedForward(&pBot->tactical_nn, nn_inputs, nn_outputs);
 
        TacticalDirective chosen_directive = NN_GetBestDirective(nn_outputs, NUM_TACTICAL_DIRECTIVES);
+       pBot->last_chosen_directive_for_fitness_eval = chosen_directive; // Store for fitness evaluation
 
        if (pBot->pEdict && pBot->name[0] != '\0') { // Ensure pEdict and name are valid
             char log_msg[128];
@@ -3018,6 +3034,5 @@ void BotThink( bot_t *pBot )
 
    return;
 }
-
 
 [end of bot.cpp]

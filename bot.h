@@ -316,6 +316,16 @@ typedef struct
    TacticalNeuralNetwork_t tactical_nn;
    bool nn_initialized;
    float f_next_tactical_nn_eval_time;
+
+   // Fitness-related stats for current evaluation period
+   float fitness_score;                              // Final fitness from last generation
+   float current_eval_score_contribution;          // e.g., points from objectives, direct score actions
+   int   current_eval_objectives_captured_or_defended; // Count of objectives this bot helped secure
+   int   current_eval_kills;
+   int   current_eval_deaths;
+   float current_eval_damage_dealt;                  // Might be harder to track accurately without engine support
+   float current_eval_survival_start_time;           // Time evaluation period started or bot spawned
+   TacticalDirective last_chosen_directive_for_fitness_eval; // Directive active around key events
 } bot_t;
 
 

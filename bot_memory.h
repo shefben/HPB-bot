@@ -1,11 +1,15 @@
 #ifndef BOT_MEMORY_H
 #define BOT_MEMORY_H
 
-#include "bot.h" // For BOT_NAME_LEN, BOT_SKIN_LEN, etc.
+#include "bot.h"                 // For BOT_NAME_LEN, BOT_SKIN_LEN, etc.
+#include "bot_neuro_evolution.h" // For MAX_NN_WEIGHT_SIZE, TacticalNeuralNetwork_t (needed if used directly, for now just MAX_NN_WEIGHT_SIZE)
+#include "bot_objective_discovery.h" // For ObjectiveType_e, ActivationMethod_e (used in SavedDiscoveredObjective_t)
+                                     // This also implies bot_tactical_ai.h is included by one of these, for the base ObjectiveType_e
+#include "extdll.h"              // For Vector
 
 // Header for the consolidated bot memory file
 typedef struct {
-    char file_signature[16];      // e.g., "HPB_BOT_MEM_V1"
+    char file_signature[16];      // e.g., "HPB_BOT_MEM_V1" (Consider V2 or V3 now)
     int file_version;             // For future format changes
     char map_name[32];            // Name of the map this memory is associated with
     int num_waypoints_in_file;    // Number of waypoints saved
@@ -13,17 +17,44 @@ typedef struct {
     int num_discovered_objectives; // Number of discovered objectives saved
 } bot_memory_file_hdr_t;
 
+// Structure to hold persistent data for a single bot
+typedef struct {
+    // Original personality fields
+    char name[BOT_NAME_LEN + 1];
+    char skin[BOT_SKIN_LEN + 1];
+    int bot_skill;
+    int chat_percent;
+    int taunt_percent;
+    int whine_percent;
+    int logo_percent;
+    int chat_tag_percent;
+    int chat_drop_percent;
+    int chat_swap_percent;
+    int chat_lower_percent;
+    int reaction_time;
+    int top_color;
+    int bottom_color;
+    char logo_name[16];
+    int weapon_points[6];
+    int sentrygun_waypoint;
+    int dispenser_waypoint;
+    int bot_team;
+    int bot_class;
+    bool is_used_in_save;
 
-#include "bot_tactical_ai.h" // For ObjectiveType_e
-#include "bot_objective_discovery.h" // For ActivationMethod_e
-#include "bot_neuro_evolution.h" // For MAX_NN_WEIGHT_SIZE
+    // Added for NN persistence (Neuro-Evolution for Tactics - Phase 1, Step 5)
+    bool has_saved_nn_weights;
+    float tactical_nn_weights[MAX_NN_WEIGHT_SIZE]; // MAX_NN_WEIGHT_SIZE from bot_neuro_evolution.h
 
-// New struct for saving discovered objectives:
+} persistent_bot_data_t;
+
+
+// New struct for saving discovered objectives (Objective Learning - Phase 2, Step 4)
 typedef struct {
     Vector location;
     char entity_classname[64];
     char entity_targetname[64];
-    int unique_id; // Original unique_id (waypoint index or dynamic ID)
+    int unique_id;
 
     ObjectiveType_e learned_objective_type;
     float confidence_score;
@@ -31,59 +62,15 @@ typedef struct {
     int positive_event_correlations;
     int negative_event_correlations;
 
-    // New fields for Phase 2 Step 3
+    // Added in Objective Learning - Phase 2, Step 5 (via subtask for that step)
     int current_owner_team;
     ActivationMethod_e learned_activation_method;
+
 } SavedDiscoveredObjective_t;
 
 
-// Structure to hold persistent data for a single bot
-typedef struct {
-    // Persisted from bot_t
-    char name[BOT_NAME_LEN + 1];
-    char skin[BOT_SKIN_LEN + 1]; // If different from default for model
-    int bot_skill;               // 0-4
-
-    int chat_percent;
-    int taunt_percent;
-    int whine_percent;
-    int logo_percent;
-
-    int chat_tag_percent;
-    int chat_drop_percent;
-    int chat_swap_percent;
-    int chat_lower_percent;
-
-    int reaction_time; // milliseconds
-
-    int top_color;    // -1 if not set
-    int bottom_color; // -1 if not set
-    char logo_name[16];
-
-    // Waypoint related memory specific to a bot's preferences/learning
-    // These might be indices into the main waypoints array or special values.
-    // Ensure they are handled correctly during load if waypoints change.
-    int weapon_points[6];
-    int sentrygun_waypoint; // index or -1
-    int dispenser_waypoint; // index or -1
-
-    // Team and class preferences, if they are to be remembered
-    // These are often set during bot creation arguments, but saving them
-    // could represent a learned preference if bots could change them.
-    int bot_team;   // Team preference
-    int bot_class;  // Class preference for that team
-
-    // Add a field to indicate if this slot was in use,
-    // so we know whether the loaded data is meaningful.
-    bool is_used_in_save;
-
-    // NN Weights
-    bool has_saved_nn_weights;
-    float tactical_nn_weights[MAX_NN_WEIGHT_SIZE];
-
-} persistent_bot_data_t;
-
-#ifndef BOT_MEMORY_FUNCS_H // Guard against multiple inclusions if moved later
+// Function Prototypes for save/load functions (defined in bot_memory.cpp)
+#ifndef BOT_MEMORY_FUNCS_H
 #define BOT_MEMORY_FUNCS_H
 void SaveBotMemory(const char *filename);
 void LoadBotMemory(const char *filename);

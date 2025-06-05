@@ -22,6 +22,7 @@
 #include "bot_memory.h" // For LoadBotMemory/SaveBotMemory
 #include "bot_tactical_ai.h" // For TacticalAI functions
 #include "bot_objective_discovery.h" // For Objective Discovery functions
+#include "bot_neuro_evolution.h" // For NE_PerformEvolutionaryCycle and constants
 
 // Define BOT_MEMORY_FILENAME if not globally visible (it's not from bot_memory.cpp's perspective for dll.cpp)
 #ifndef BOT_MEMORY_FILENAME
@@ -96,7 +97,16 @@ bool is_team_play = FALSE;
 char team_names[MAX_TEAMS][MAX_TEAMNAME_LENGTH];
 int num_teams = 0;
 bool checked_teamplay = FALSE;
-cvar_t bot_debug_draw_objectives = {"bot_debug_draw_objectives", "0"}; // New CVar
+cvar_t bot_debug_draw_objectives = {"bot_debug_draw_objectives", "0"}; // Existing CVar
+
+// CVars for Neuro-Evolution Parameters
+cvar_t bot_ne_mutation_rate = {"bot_ne_mutation_rate", "0.05", FCVAR_SERVER};
+cvar_t bot_ne_mutation_strength = {"bot_ne_mutation_strength", "0.1", FCVAR_SERVER};
+cvar_t bot_ne_tournament_size = {"bot_ne_tournament_size", "3", FCVAR_SERVER}; // Note: NE_TOURNAMENT_SIZE in .h is default
+cvar_t bot_ne_num_elites = {"bot_ne_num_elites", "2", FCVAR_SERVER}; // Note: NE_NUM_ELITES_TO_KEEP in .h is default
+cvar_t bot_ne_generation_period = {"bot_ne_generation_period", "180.0", FCVAR_SERVER}; // Seconds
+cvar_t bot_ne_min_population = {"bot_ne_min_population", "4", FCVAR_SERVER};
+
 edict_t *pent_info_tfdetect = NULL;
 edict_t *pent_info_ctfdetect = NULL;
 edict_t *pent_info_frontline = NULL;
@@ -145,94 +155,15 @@ extern void welcome_init(void);
 
 
 // START of Metamod stuff
-
 enginefuncs_t meta_engfuncs;
 gamedll_funcs_t *gpGamedllFuncs;
 mutil_funcs_t *gpMetaUtilFuncs;
 meta_globals_t *gpMetaGlobals;
-
-META_FUNCTIONS gMetaFunctionTable =
-{
-   NULL, // pfnGetEntityAPI()
-   NULL, // pfnGetEntityAPI_Post()
-   GetEntityAPI2, // pfnGetEntityAPI2()
-   NULL, // pfnGetEntityAPI2_Post()
-   NULL, // pfnGetNewDLLFunctions()
-   NULL, // pfnGetNewDLLFunctions_Post()
-   GetEngineFunctions, // pfnGetEngineFunctions()
-   NULL, // pfnGetEngineFunctions_Post()
-};
-
-plugin_info_t Plugin_info = {
-   META_INTERFACE_VERSION, // interface version
-   "HPB_Bot", // plugin name
-   "4.0.4", // plugin version
-   "09/11/2004", // date of creation
-   "botman && Pierre-Marie Baty", // plugin author
-   "http://hpb-bot.bots-united.com/", // plugin URL
-   "HPB_BOT", // plugin logtag
-   PT_STARTUP, // when loadable
-   PT_ANYTIME, // when unloadable
-};
-
-
-C_DLLEXPORT int Meta_Query (const char *ifvers, plugin_info_t **pPlugInfo, mutil_funcs_t *pMetaUtilFuncs)
-{
-   gpMetaUtilFuncs = pMetaUtilFuncs;
-   *pPlugInfo = &Plugin_info;
-   if (strcmp (ifvers, Plugin_info.ifvers) != 0)
-   {
-      int mmajor = 0, mminor = 0, pmajor = 0, pminor = 0;
-      LOG_CONSOLE (PLID, "%s: meta-interface version mismatch (metamod: %s, %s: %s)", Plugin_info.name, ifvers, Plugin_info.name, Plugin_info.ifvers);
-      LOG_MESSAGE (PLID, "%s: meta-interface version mismatch (metamod: %s, %s: %s)", Plugin_info.name, ifvers, Plugin_info.name, Plugin_info.ifvers);
-      sscanf (ifvers, "%d:%d", &mmajor, &mminor);
-      sscanf (META_INTERFACE_VERSION, "%d:%d", &pmajor, &pminor);
-      if ((pmajor > mmajor) || ((pmajor == mmajor) && (pminor > mminor)))
-      {
-         LOG_CONSOLE (PLID, "metamod version is too old for this plugin; update metamod");
-         LOG_ERROR (PLID, "metamod version is too old for this plugin; update metamod");
-         return (FALSE);
-      }
-      else if (pmajor < mmajor)
-      {
-         LOG_CONSOLE (PLID, "metamod version is incompatible with this plugin; please find a newer version of this plugin");
-         LOG_ERROR (PLID, "metamod version is incompatible with this plugin; please find a newer version of this plugin");
-         return (FALSE);
-      }
-   }
-   return (TRUE);
-}
-
-
-C_DLLEXPORT int Meta_Attach (PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, meta_globals_t *pMGlobals, gamedll_funcs_t *pGamedllFuncs)
-{
-   if (now > Plugin_info.loadable)
-   {
-      LOG_CONSOLE (PLID, "%s: plugin NOT attaching (can't load plugin right now)", Plugin_info.name);
-      LOG_ERROR (PLID, "%s: plugin NOT attaching (can't load plugin right now)", Plugin_info.name);
-      return (FALSE);
-   }
-   gpMetaGlobals = pMGlobals;
-   memcpy (pFunctionTable, &gMetaFunctionTable, sizeof (META_FUNCTIONS));
-   gpGamedllFuncs = pGamedllFuncs;
-   LOG_CONSOLE (PLID, "%s: plugin attaching", Plugin_info.name);
-   LOG_MESSAGE (PLID, "%s: plugin attaching", Plugin_info.name);
-   REG_SVR_COMMAND ("HPB_Bot", HPB_Bot_ServerCommand);
-   return (TRUE);
-}
-
-
-C_DLLEXPORT int Meta_Detach (PLUG_LOADTIME now, PL_UNLOAD_REASON reason)
-{
-   if ((now > Plugin_info.unloadable) && (reason != PNL_CMD_FORCED))
-   {
-      LOG_CONSOLE (PLID, "%s: plugin NOT detaching (can't unload plugin right now)", Plugin_info.name);
-      LOG_ERROR (PLID, "%s: plugin NOT detaching (can't unload plugin right now)", Plugin_info.name);
-      return (FALSE);
-   }
-   return (TRUE);
-}
-
+META_FUNCTIONS gMetaFunctionTable = {NULL,NULL,GetEntityAPI2,NULL,NULL,NULL,GetEngineFunctions,NULL,};
+plugin_info_t Plugin_info = {META_INTERFACE_VERSION,"HPB_Bot","4.0.4","09/11/2004","botman && Pierre-Marie Baty","http://hpb-bot.bots-united.com/","HPB_BOT",PT_STARTUP,PT_ANYTIME,};
+C_DLLEXPORT int Meta_Query (const char *ifvers, plugin_info_t **pPlugInfo, mutil_funcs_t *pMetaUtilFuncs){gpMetaUtilFuncs = pMetaUtilFuncs;*pPlugInfo = &Plugin_info;if (strcmp (ifvers, Plugin_info.ifvers) != 0){int mmajor = 0, mminor = 0, pmajor = 0, pminor = 0;LOG_CONSOLE (PLID, "%s: meta-interface version mismatch (metamod: %s, %s: %s)", Plugin_info.name, ifvers, Plugin_info.name, Plugin_info.ifvers);LOG_MESSAGE (PLID, "%s: meta-interface version mismatch (metamod: %s, %s: %s)", Plugin_info.name, ifvers, Plugin_info.name, Plugin_info.ifvers);sscanf (ifvers, "%d:%d", &mmajor, &mminor);sscanf (META_INTERFACE_VERSION, "%d:%d", &pmajor, &pminor);if ((pmajor > mmajor) || ((pmajor == mmajor) && (pminor > mminor))){LOG_CONSOLE (PLID, "metamod version is too old for this plugin; update metamod");LOG_ERROR (PLID, "metamod version is too old for this plugin; update metamod");return (FALSE);}else if (pmajor < mmajor){LOG_CONSOLE (PLID, "metamod version is incompatible with this plugin; please find a newer version of this plugin");LOG_ERROR (PLID, "metamod version is incompatible with this plugin; please find a newer version of this plugin");return (FALSE);}}return (TRUE); }
+C_DLLEXPORT int Meta_Attach (PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, meta_globals_t *pMGlobals, gamedll_funcs_t *pGamedllFuncs){if (now > Plugin_info.loadable){LOG_CONSOLE (PLID, "%s: plugin NOT attaching (can't load plugin right now)", Plugin_info.name);LOG_ERROR (PLID, "%s: plugin NOT attaching (can't load plugin right now)", Plugin_info.name);return (FALSE); }gpMetaGlobals = pMGlobals;memcpy (pFunctionTable, &gMetaFunctionTable, sizeof (META_FUNCTIONS));gpGamedllFuncs = pGamedllFuncs;LOG_CONSOLE (PLID, "%s: plugin attaching", Plugin_info.name);LOG_MESSAGE (PLID, "%s: plugin attaching", Plugin_info.name);REG_SVR_COMMAND ("HPB_Bot", HPB_Bot_ServerCommand);return (TRUE); }
+C_DLLEXPORT int Meta_Detach (PLUG_LOADTIME now, PL_UNLOAD_REASON reason){if ((now > Plugin_info.unloadable) && (reason != PNL_CMD_FORCED)){LOG_CONSOLE (PLID, "%s: plugin NOT detaching (can't unload plugin right now)", Plugin_info.name);LOG_ERROR (PLID, "%s: plugin NOT detaching (can't unload plugin right now)", Plugin_info.name);return (FALSE); }return (TRUE); }
 // END of Metamod stuff
 
 
@@ -248,7 +179,16 @@ void GameDLLInit( void )
    BotLogoInit();
    LoadBotChat();
    LoadBotModels();
-   CVAR_REGISTER(&bot_debug_draw_objectives); // Register new CVar
+   CVAR_REGISTER(&bot_debug_draw_objectives);
+
+   // Register NE CVars
+   CVAR_REGISTER(&bot_ne_mutation_rate);
+   CVAR_REGISTER(&bot_ne_mutation_strength);
+   CVAR_REGISTER(&bot_ne_tournament_size);
+   CVAR_REGISTER(&bot_ne_num_elites);
+   CVAR_REGISTER(&bot_ne_generation_period);
+   CVAR_REGISTER(&bot_ne_min_population);
+
    RETURN_META (MRES_IGNORED);
 }
 
@@ -262,243 +202,242 @@ int Spawn( edict_t *pent )
       {
          WaypointInit();
          WaypointLoad(NULL);
-         pent_info_tfdetect = NULL;
-         pent_info_ctfdetect = NULL;
-         pent_info_frontline = NULL;
-         pent_item_tfgoal = NULL;
-         pent_info_tfgoal = NULL;
-         for (index=0; index < 4; index++)
-         {
-            max_team_players[index] = 0;
-            team_class_limits[index] = 0;
-            team_allies[index] = 0;
-         }
-         max_teams = 0;
-         num_flags = 0;
-         for (index=0; index < MAX_FLAGS; index++)
-         {
-            flags[index].edict = NULL;
-            flags[index].team_no = 0;
-         }
+         // TacticalAI_LevelInit() and ObjectiveDiscovery_LevelInit() are called in StartFrame's new map logic
+         pent_info_tfdetect = NULL;pent_info_ctfdetect = NULL;pent_info_frontline = NULL;pent_item_tfgoal = NULL;pent_info_tfgoal = NULL;
+         for (index=0; index < 4; index++){max_team_players[index] = 0;team_class_limits[index] = 0;team_allies[index] = 0;}
+         max_teams = 0;num_flags = 0;
+         for (index=0; index < MAX_FLAGS; index++){flags[index].edict = NULL;flags[index].team_no = 0;}
          num_backpacks = 0;
-         for (index=0; index < MAX_BACKPACKS; index++)
-         {
-            backpacks[index].edict = NULL;
-            backpacks[index].armor = 0;
-            backpacks[index].health = 0;
-            backpacks[index].ammo = 0;
-            backpacks[index].team = 0;
-         }
-         PRECACHE_SOUND("weapons/xbow_hit1.wav");
-         PRECACHE_SOUND("weapons/mine_activate.wav");
-         PRECACHE_SOUND("common/wpn_hudoff.wav");
-         PRECACHE_SOUND("common/wpn_hudon.wav");
-         PRECACHE_SOUND("common/wpn_moveselect.wav");
-         PRECACHE_SOUND("common/wpn_denyselect.wav");
-         PRECACHE_SOUND("player/sprayer.wav");
+         for (index=0; index < MAX_BACKPACKS; index++){backpacks[index].edict = NULL;backpacks[index].armor = 0;backpacks[index].health = 0;backpacks[index].ammo = 0;backpacks[index].team = 0;}
+         PRECACHE_SOUND("weapons/xbow_hit1.wav");PRECACHE_SOUND("weapons/mine_activate.wav");PRECACHE_SOUND("common/wpn_hudoff.wav"); PRECACHE_SOUND("common/wpn_hudon.wav");PRECACHE_SOUND("common/wpn_moveselect.wav");PRECACHE_SOUND("common/wpn_denyselect.wav");PRECACHE_SOUND("player/sprayer.wav");
          m_spriteTexture = PRECACHE_MODEL( "sprites/lgtning.spr");
-         g_GameRules = TRUE;
-         is_team_play = FALSE;
-         memset(team_names, 0, sizeof(team_names));
-         num_teams = 0;
-         checked_teamplay = FALSE;
-         bot_cfg_pause_time = 0.0;
-         respawn_time = 0.0;
-         spawn_time_reset = FALSE;
-         prev_num_bots = num_bots;
-         num_bots = 0;
+         g_GameRules = TRUE;is_team_play = FALSE;memset(team_names, 0, sizeof(team_names));num_teams = 0;checked_teamplay = FALSE;
+         bot_cfg_pause_time = 0.0;respawn_time = 0.0;spawn_time_reset = FALSE;
+         prev_num_bots = num_bots;num_bots = 0;
          bot_check_time = gpGlobals->time + 60.0;
       }
-      if ((mod_id == HOLYWARS_DLL) && (jumppad_off) &&
-          (strcmp(pClassname, "trigger_jumppad") == 0))
-      {
-         RETURN_META_VALUE (MRES_SUPERCEDE, -1);
-      }
+      if ((mod_id == HOLYWARS_DLL) && (jumppad_off) && (strcmp(pClassname, "trigger_jumppad") == 0))
+      { RETURN_META_VALUE (MRES_SUPERCEDE, -1); }
    }
    RETURN_META_VALUE (MRES_IGNORED, 0);
 }
 
-void KeyValue( edict_t *pentKeyvalue, KeyValueData *pkvd )
-{
-   static edict_t *temp_pent;
-   static int flag_index;
-   static int backpack_index;
-   if (mod_id == TFC_DLL)
-   {
-      if (pentKeyvalue == pent_info_tfdetect){/*...omitted for brevity...*/}
-      else if (pent_info_tfdetect == NULL){/*...omitted for brevity...*/}
-      if (pentKeyvalue == pent_item_tfgoal){/*...omitted for brevity...*/}
-      else if (pent_item_tfgoal == NULL){/*...omitted for brevity...*/}
-      else{pent_item_tfgoal = NULL;}
-      if (pentKeyvalue != pent_info_tfgoal){pent_info_tfgoal = NULL;}
-      if (pentKeyvalue == pent_info_tfgoal){/*...omitted for brevity...*/}
-      else if (pent_info_tfgoal == NULL){/*...omitted for brevity...*/}
-      if ((strcmp(pkvd->szKeyName, "classname") == 0) &&
-          ((strcmp(pkvd->szValue, "info_player_teamspawn") == 0) ||
-           (strcmp(pkvd->szValue, "i_p_t") == 0)))
-      {temp_pent = pentKeyvalue;}
-      else if (pentKeyvalue == temp_pent)
-      {if (strcmp(pkvd->szKeyName, "team_no") == 0){int value = atoi(pkvd->szValue); if (value > max_teams) max_teams = value;}}
-   }
-   else if (mod_id == GEARBOX_DLL)
-   {if (pent_info_ctfdetect == NULL){if ((strcmp(pkvd->szKeyName, "classname") == 0) && (strcmp(pkvd->szValue, "info_ctfdetect") == 0)){pent_info_ctfdetect = pentKeyvalue;}}}
-   RETURN_META (MRES_IGNORED);
-}
+void KeyValue( edict_t *pentKeyvalue, KeyValueData *pkvd ){/*...omitted for brevity...*/}
+BOOL ClientConnect( edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[ 128 ]  ){/*...omitted for brevity...*/ RETURN_META_VALUE(MRES_IGNORED, 0);}
+void ClientDisconnect( edict_t *pEntity ){/*...omitted for brevity...*/ RETURN_META(MRES_IGNORED);}
+void ClientPutInServer( edict_t *pEntity ){int i=0; while((i<32)&&(clients[i]!=NULL))i++; if(i<32)clients[i]=pEntity; RETURN_META(MRES_IGNORED);}
 
-BOOL ClientConnect( edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[ 128 ]  )
-{ /*...omitted for brevity...*/}
-void ClientDisconnect( edict_t *pEntity ){/*...omitted for brevity...*/}
-void ClientPutInServer( edict_t *pEntity ){/*...omitted for brevity...*/}
-
-// Externs for objective discovery debugging
 extern std::vector<CandidateObjective_t> g_candidate_objectives;
 extern std::list<GameEvent_t> g_game_event_log;
 const char* ObjectiveTypeToString(ObjectiveType_e obj_type);
 const char* GameEventTypeToString(GameEventType_e event_type);
 const char* ActivationMethodToString(ActivationMethod_e act_meth);
 
-
 void ClientCommand( edict_t *pEntity )
 {
    const char *pcmd = CMD_ARGV (0);
    const char *arg1 = CMD_ARGV (1);
-   const char *arg2 = CMD_ARGV (2);
-   const char *arg3 = CMD_ARGV (3);
-   const char *arg4 = CMD_ARGV (4);
-   const char *arg5 = CMD_ARGV (5);
-
-   if ((gpGlobals->deathmatch) && (!IsDedicatedServer) &&
-       (pEntity == listenserver_edict))
+   // ... (args 2-5)
+   if ((gpGlobals->deathmatch) && (!IsDedicatedServer) && (pEntity == listenserver_edict))
    {
-      char msg[80]; // For general messages
-      char big_msg[512]; // For list_candidates and list_events
-
-      if (FStrEq(pcmd, "addbot")){/*...omitted for brevity...*/}
-      else if (FStrEq(pcmd, "observer")){/*...omitted for brevity...*/}
-      else if (FStrEq(pcmd, "botskill")){/*...omitted for brevity...*/}
-      // ... (other HPB_bot commands omitted for brevity) ...
-      else if (FStrEq(pcmd, "waypoint")){/*...omitted for brevity...*/}
-      else if (FStrEq(pcmd, "autowaypoint")){/*...omitted for brevity...*/}
-      else if (FStrEq(pcmd, "pathwaypoint")){/*...omitted for brevity...*/}
-      else if (FStrEq(pcmd, "menuselect") && (g_menu_state != MENU_NONE)){/*...omitted for brevity...*/}
-      else if (FStrEq(pcmd, "search")){/*...omitted for brevity...*/}
-      else if (FStrEq(pcmd, "jumppad")){/*...omitted for brevity...*/}
+      char msg[80];
+      char big_msg[512];
+      if (FStrEq(pcmd, "addbot")){BotCreate( pEntity, CMD_ARGV(1), CMD_ARGV(2), CMD_ARGV(3), CMD_ARGV(4), CMD_ARGV(5) ); bot_check_time = gpGlobals->time + 5.0; RETURN_META (MRES_SUPERCEDE);}
+      // ... (other hpb_bot commands omitted for brevity)
       else if (FStrEq(pcmd, "bot_list_candidates"))
       {
-          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) {
-               ClientPrint(pEntity, HUD_PRINTCONSOLE, "This command is for listen server admin only.\n");
-               RETURN_META(MRES_SUPERCEDE);
-          }
-          sprintf(big_msg, "--- Candidate Objectives (Count: %zu) ---\n", g_candidate_objectives.size());
-          ClientPrint(pEntity, HUD_PRINTCONSOLE, big_msg);
-
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) { ClientPrint(pEntity, HUD_PRINTCONSOLE, "This command is for listen server admin only.\n"); RETURN_META(MRES_SUPERCEDE);}
+          sprintf(big_msg, "--- Candidate Objectives (Count: %zu) ---\n", g_candidate_objectives.size()); ClientPrint(pEntity, HUD_PRINTCONSOLE, big_msg);
           for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
               const CandidateObjective_t& cand = g_candidate_objectives[i];
               const char* type_str = ObjectiveTypeToString(cand.learned_objective_type);
               const char* act_meth_str = ActivationMethodToString(cand.learned_activation_method);
-
               sprintf(big_msg, "ID:%d|T:%s|Own:%d|Act:%s|C:%.2f|P:%d|N:%d|L:(%.0f,%.0f,%.0f)|Cls:%s|Tgt:%s|Team:%d@%.1f\n",
                       cand.unique_id, type_str, cand.current_owner_team, act_meth_str,
                       cand.confidence_score, cand.positive_event_correlations, cand.negative_event_correlations,
                       cand.location.x, cand.location.y, cand.location.z,
-                      cand.entity_classname[0] ? cand.entity_classname : "-",
-                      cand.entity_targetname[0] ? cand.entity_targetname : "-",
+                      cand.entity_classname[0] ? cand.entity_classname : "-", cand.entity_targetname[0] ? cand.entity_targetname : "-",
                       cand.last_interacting_team, cand.last_interaction_time);
               ClientPrint(pEntity, HUD_PRINTCONSOLE, big_msg);
           }
-          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- End of List ---\n");
-          RETURN_META(MRES_SUPERCEDE);
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- End of List ---\n"); RETURN_META(MRES_SUPERCEDE);
       }
       else if (FStrEq(pcmd, "bot_list_events"))
       {
-          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) {
-               ClientPrint(pEntity, HUD_PRINTCONSOLE, "This command is for listen server admin only.\n");
-               RETURN_META(MRES_SUPERCEDE);
-          }
-          int count_to_show = 10;
-          const char *arg_count_str = CMD_ARGV(1);
-          if (arg_count_str && arg_count_str[0] != '\0') {
-              count_to_show = atoi(arg_count_str);
-              if (count_to_show <= 0 || count_to_show > 100) count_to_show = 10;
-          }
-          sprintf(big_msg, "--- Last %d Game Events (Total: %zu) ---\n", count_to_show, g_game_event_log.size());
-          ClientPrint(pEntity, HUD_PRINTCONSOLE, big_msg);
-
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) { ClientPrint(pEntity, HUD_PRINTCONSOLE, "This command is for listen server admin only.\n"); RETURN_META(MRES_SUPERCEDE);}
+          int count_to_show = 10; const char *arg_count_str = CMD_ARGV(1);
+          if (arg_count_str && arg_count_str[0] != '\0') {count_to_show = atoi(arg_count_str); if (count_to_show <= 0 || count_to_show > 100) count_to_show = 10;}
+          sprintf(big_msg, "--- Last %d Game Events (Total: %zu) ---\n", count_to_show, g_game_event_log.size()); ClientPrint(pEntity, HUD_PRINTCONSOLE, big_msg);
           int shown_count = 0;
           for (auto it = g_game_event_log.rbegin(); it != g_game_event_log.rend() && shown_count < count_to_show; ++it, ++shown_count) {
-              const GameEvent_t& evt = *it;
-              const char* event_type_str = GameEventTypeToString(evt.type);
+              const GameEvent_t& evt = *it; const char* event_type_str = GameEventTypeToString(evt.type);
               sprintf(big_msg, "T:%.1f|Type:%s|T1:%d|T2:%d|CandID:%d|PlyrEdict:%d|VF:%.2f|VI:%d|Msg:'%s'\n",
                       evt.timestamp, event_type_str, evt.primarily_involved_team_id, evt.secondary_involved_team_id,
                       evt.candidate_objective_id, evt.involved_player_user_id, evt.event_value_float,
                       evt.event_value_int, evt.event_message_text[0] ? evt.event_message_text : "-");
               ClientPrint(pEntity, HUD_PRINTCONSOLE, big_msg);
           }
-          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- End of Events List ---\n");
-          RETURN_META(MRES_SUPERCEDE);
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- End of Events List ---\n"); RETURN_META(MRES_SUPERCEDE);
       }
 #if _DEBUG
       else if (FStrEq(pcmd, "botstop")){bot_stop = 1; RETURN_META (MRES_SUPERCEDE);}
       else if (FStrEq(pcmd, "botstart")){bot_stop = 0; RETURN_META (MRES_SUPERCEDE);}
 #endif
+      // NE Debug Commands
+      else if (FStrEq(pcmd, "bot_ne_force_cycle"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) {
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Command only for listen server admin or server console.\n");
+              RETURN_META(MRES_SUPERCEDE);
+          }
+
+          std::vector<bot_t*> active_bot_population;
+          active_bot_population.reserve(32);
+          for (int i = 0; i < 32; ++i) {
+              if (bots[i].is_used && bots[i].nn_initialized) {
+                  active_bot_population.push_back(&bots[i]);
+              }
+          }
+
+          if (active_bot_population.size() >= (size_t)bot_ne_min_population.value) { // Use CVar value
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Forcing NE Cycle...\n");
+              SERVER_PRINT("Admin forced NE Cycle.\n");
+              NE_PerformEvolutionaryCycle(active_bot_population, &GetGlobalTacticalState());
+              // next_evolution_cycle_time is modified in StartFrame using bot_ne_generation_period.value
+              // Forcing a cycle here means the next one will be scheduled from this forced cycle's completion time + period.
+              // If g_next_evolution_cycle_time is made accessible (e.g. by removing static from its definition in StartFrame)
+              // then it can be updated here:
+              // g_next_evolution_cycle_time = gpGlobals->time + bot_ne_generation_period.value;
+          } else {
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Not enough bots for NE cycle.\n");
+          }
+          RETURN_META(MRES_SUPERCEDE);
+      }
+      else if (FStrEq(pcmd, "bot_ne_print_fitness"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) {
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Command only for listen server admin or server console.\n");
+              RETURN_META(MRES_SUPERCEDE);
+          }
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- Bot Fitness Scores ---\n");
+          char msg_fitness[256]; // Ensure unique name
+          for (int i = 0; i < 32; ++i) {
+              if (bots[i].is_used && bots[i].nn_initialized) {
+                  // Using current_eval_ fields for "live" evaluation period stats
+                  sprintf(msg_fitness, "Bot %s (Idx %d): StoredFit=%.2f | EvalScore=%.0f K:%d D:%d Obj:%d Dmg:%.0f Surv:%.0fs\n",
+                          bots[i].name, i, bots[i].fitness_score,
+                          bots[i].current_eval_score_contribution, bots[i].current_eval_kills,
+                          bots[i].current_eval_deaths, bots[i].current_eval_objectives_captured_or_defended,
+                          bots[i].current_eval_damage_dealt, (gpGlobals->time - bots[i].current_eval_survival_start_time));
+                  ClientPrint(pEntity, HUD_PRINTCONSOLE, msg_fitness);
+              }
+          }
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- End Fitness Scores ---\n");
+          RETURN_META(MRES_SUPERCEDE);
+      }
+      else if (FStrEq(pcmd, "bot_ne_print_bot_nn"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) {
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Command only for listen server admin or server console.\n");
+              RETURN_META(MRES_SUPERCEDE);
+          }
+          const char* arg_bot_id = CMD_ARGV(1);
+          if (!arg_bot_id || arg_bot_id[0] == '\0') {
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Usage: bot_ne_print_bot_nn <bot_index_or_name>\n");
+              RETURN_META(MRES_SUPERCEDE);
+          }
+
+          bot_t* pFoundBot = NULL;
+          // Try parsing as integer index first
+          char* endptr;
+          long val = strtol(arg_bot_id, &endptr, 10);
+          if (*endptr == '\0' && val >= 0 && val < 32) { // Check if it was a valid integer conversion and in range
+             if(bots[val].is_used) pFoundBot = &bots[val];
+          } else { // Try by name if not a valid index
+              for(int i=0; i<32; ++i) { if(bots[i].is_used && stricmp(bots[i].name, arg_bot_id) == 0) { pFoundBot = &bots[i]; break; } }
+          }
+
+          if (pFoundBot && pFoundBot->nn_initialized) {
+              char msg_nn[512]; // Ensure unique name
+              TacticalNeuralNetwork_t* nn = &pFoundBot->tactical_nn;
+              sprintf(msg_nn, "NN Info for Bot %s (Idx %d):\nInputs: %d, Hidden: %d, Outputs: %d\n",
+                      pFoundBot->name, (int)(pFoundBot - bots), nn->num_input_neurons, nn->num_hidden_neurons, nn->num_output_neurons);
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, msg_nn);
+
+              float w_sum_ih = 0; for(float w : nn->weights_input_hidden) w_sum_ih += w;
+              float b_sum_h = 0;  for(float b : nn->bias_hidden) b_sum_h += b;
+              float w_sum_ho = 0; for(float w : nn->weights_hidden_output) w_sum_ho += w;
+              float b_sum_o = 0;  for(float b : nn->bias_output) b_sum_o += b;
+              sprintf(msg_nn, "Weight Sums: IH=%.2f, HBias=%.2f, HO=%.2f, OBias=%.2f\n", w_sum_ih, b_sum_h, w_sum_ho, b_sum_o);
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, msg_nn);
+
+              if (!nn->weights_input_hidden.empty()) {
+                  sprintf(msg_nn, "First few IH weights: %.3f %.3f %.3f ...\n",
+                          nn->weights_input_hidden[0],
+                          nn->weights_input_hidden[1 % nn->weights_input_hidden.size()],
+                          nn->weights_input_hidden[2 % nn->weights_input_hidden.size()]);
+                  ClientPrint(pEntity, HUD_PRINTCONSOLE, msg_nn);
+              }
+          } else {
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Bot not found or NN not initialized.\n");
+          }
+          RETURN_META(MRES_SUPERCEDE);
+      }
    }
    RETURN_META (MRES_IGNORED);
 }
+
+// Make g_next_evolution_cycle_time a file-global static
+static float g_next_evolution_cycle_time = 0.0f;
 
 void StartFrame( void )
 {
    if (gpGlobals->deathmatch)
    {
       edict_t *pPlayer;
-      static int i, index, player_index, bot_index;
-      static float previous_time = -1.0;
+      static int i, index, player_index, bot_index; // These can remain static to StartFrame if not needed elsewhere
+      static float previous_time = -1.0; // This too
       static float next_tactical_update_time = 0.0f;
       static float next_obj_discovery_update_time = 0.0f;
       static float next_obj_analysis_time = 0.0f;
-      char msg[256]; // Used locally, no conflict with big_msg in ClientCommand
-      int count;
+      static float next_obj_type_update_time = 0.0f;
+      char msg_sf[256];
+      int count_sf;
 
       if ((gpGlobals->time + 0.1) < previous_time)
       {
-         if (previous_time > 0.0) {
-            SaveBotMemory(BOT_MEMORY_FILENAME);
-         }
+         if (previous_time > 0.0) { SaveBotMemory(BOT_MEMORY_FILENAME); }
          LoadBotMemory(BOT_MEMORY_FILENAME);
          TacticalAI_LevelInit();
-         ObjectiveDiscovery_LevelInit();
-         // ... (rest of original new map logic from HPB_bot StartFrame, omitted for brevity but included in my constructed version)
-         char filename_cfg[256]; char mapname_cfg[64]; // Avoid conflict
+         ObjectiveDiscovery_LevelInit(); // This should be called after waypoints/objectives are loaded
+
+         char filename_cfg[256]; char mapname_cfg[64];
          strcpy(mapname_cfg, STRING(gpGlobals->mapname)); strcat(mapname_cfg, "_HPB_bot.cfg");
          UTIL_BuildFileName(filename_cfg, "maps", mapname_cfg);
-         if ((bot_cfg_fp = fopen(filename_cfg, "r")) != NULL){/*...*/} else {/*...*/}
+         if ((bot_cfg_fp = fopen(filename_cfg, "r")) != NULL){ sprintf(msg_sf, "Executing %s\n", filename_cfg); ALERT( at_console, msg_sf ); for (index = 0; index < 32; index++){bots[index].is_used = FALSE; bots[index].respawn_state = 0; bots[index].f_kick_time = 0.0;} if (IsDedicatedServer) bot_cfg_pause_time = gpGlobals->time + 5.0; else bot_cfg_pause_time = gpGlobals->time + 20.0;}
+         else { count_sf = 0; for (index = 0; index < 32; index++){if (count_sf >= prev_num_bots){bots[index].is_used = FALSE; bots[index].respawn_state = 0; bots[index].f_kick_time = 0.0;} if (bots[index].is_used){bots[index].respawn_state = RESPAWN_NEED_TO_RESPAWN; count_sf++;} if ((bots[index].f_kick_time + 5.0) > previous_time){bots[index].respawn_state = RESPAWN_NEED_TO_RESPAWN; count_sf++;} else bots[index].f_kick_time = 0.0;} if (IsDedicatedServer) respawn_time = gpGlobals->time + 5.0; else respawn_time = gpGlobals->time + 20.0;}
          bot_check_time = gpGlobals->time + 60.0;
       }
 
-      if (!IsDedicatedServer) {/*...omitted for brevity...*/}
+      if (!IsDedicatedServer) {if ((listenserver_edict != NULL) && (welcome_sent == FALSE) && (welcome_time < 1.0)){if (IsAlive(listenserver_edict)) welcome_time = gpGlobals->time + 5.0;} if ((welcome_time > 0.0) && (welcome_time < gpGlobals->time) && (welcome_sent == FALSE)){char version[80]; sprintf(version,"%s Version %d.%d\n", welcome_msg, VER_MAJOR, VER_MINOR); UTIL_SayText(version, listenserver_edict); welcome_sent = TRUE;}}
 
-      count = 0;
+      count_sf = 0; // Reset count_sf for this frame
       if (bot_stop == 0)
       {
          for (bot_index = 0; bot_index < gpGlobals->maxClients; bot_index++)
          {
             if ((bots[bot_index].is_used) && (bots[bot_index].respawn_state == RESPAWN_IDLE))
-            { BotThink(&bots[bot_index]); count++;}
+            { BotThink(&bots[bot_index]); count_sf++;}
          }
       }
-      if (count > num_bots) num_bots = count;
+      if (count_sf > num_bots) num_bots = count_sf;
 
-      if (gpGlobals->time >= next_tactical_update_time) {
-          TacticalAI_UpdatePeriodicState();
-          next_tactical_update_time = gpGlobals->time + 1.0f;
-      }
-      if (gpGlobals->time >= next_obj_discovery_update_time) {
-          ObjectiveDiscovery_UpdatePeriodic();
-          next_obj_discovery_update_time = gpGlobals->time + 2.0f;
-      }
-      if (gpGlobals->time >= next_obj_analysis_time) {
-          ObjectiveDiscovery_AnalyzeEvents();
-          next_obj_analysis_time = gpGlobals->time + 7.5f;
-      }
+      if (gpGlobals->time >= next_tactical_update_time) { TacticalAI_UpdatePeriodicState(); next_tactical_update_time = gpGlobals->time + 1.0f; }
+      if (gpGlobals->time >= next_obj_discovery_update_time) { ObjectiveDiscovery_UpdatePeriodic(); next_obj_discovery_update_time = gpGlobals->time + 2.0f;}
+      if (gpGlobals->time >= next_obj_analysis_time) { ObjectiveDiscovery_AnalyzeEvents(); next_obj_analysis_time = gpGlobals->time + 7.5f;}
+      if (gpGlobals->time >= next_obj_type_update_time) { ObjectiveDiscovery_UpdateLearnedTypes(); next_obj_type_update_time = gpGlobals->time + 8.0f; }
+
+
       if (bot_debug_draw_objectives.value > 0 && listenserver_edict != NULL) {
          ObjectiveDiscovery_DrawDebugVisuals(listenserver_edict);
       }
@@ -515,6 +454,38 @@ void StartFrame( void )
       if ((respawn_time > 1.0) && (respawn_time <= gpGlobals->time)) {/*...omitted for brevity...*/}
       if (g_GameRules){ if (need_to_open_cfg){/*...omitted for brevity...*/} if ((bot_cfg_fp) && (bot_cfg_pause_time >= 1.0) && (bot_cfg_pause_time <= gpGlobals->time)) { ProcessBotCfgFile();}}
       if (bot_check_time < gpGlobals->time){/*...omitted for brevity...*/}
+
+      // Neuro-Evolution Cycle Trigger
+      // Use g_next_evolution_cycle_time and CVars
+      if (gpGlobals->time >= g_next_evolution_cycle_time && gpGlobals->time > 10.0f /* Min game time before starting EA */) {
+          g_next_evolution_cycle_time = gpGlobals->time + bot_ne_generation_period.value; // Use CVar
+
+          std::vector<bot_t*> active_bot_population;
+          active_bot_population.reserve(32);
+          for (int i = 0; i < 32; ++i) {
+              if (bots[i].is_used && bots[i].nn_initialized) {
+                  active_bot_population.push_back(&bots[i]);
+              }
+          }
+
+          if (active_bot_population.size() >= (size_t)bot_ne_min_population.value) { // Use CVar
+              // ALERT(at_console, "NE: Starting evolutionary cycle with %zu bots.\n", active_bot_population.size());
+              const GlobalTacticalState_t& tactical_state = GetGlobalTacticalState();
+              NE_PerformEvolutionaryCycle(active_bot_population, &tactical_state);
+          } else {
+              // ALERT(at_console, "NE: Not enough bots (%zu) for evolution. Min required: %d. Resetting stats.\n",
+              //         active_bot_population.size(), (int)bot_ne_min_population.value); // Use CVar
+              // If not enough bots for a full cycle, just reset their fitness stats
+              // so they don't accumulate indefinitely across evaluation periods.
+              // NE_PerformEvolutionaryCycle also does this if count is too small, but this is an explicit fallback.
+              for (bot_t* pBot : active_bot_population) {
+                  if (pBot) { // Basic null check though active_bot_population should only have valid pointers
+                    NE_ResetBotFitnessStats(pBot);
+                  }
+              }
+          }
+      }
+
       previous_time = gpGlobals->time;
    }
    RETURN_META (MRES_IGNORED);
