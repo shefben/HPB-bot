@@ -22,6 +22,7 @@
 #include "bot_objective_discovery.h"
 #include "bot_tactical_ai.h"
 #include "bot_neuro_evolution.h"
+#include "bot_rl_aiming.h"         // For RL Aiming agent
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -219,6 +220,11 @@ void BotSpawnInit( bot_t *pBot )
    pBot->current_eval_damage_dealt = 0.0f;
    pBot->current_eval_survival_start_time = gpGlobals->time;
    pBot->last_chosen_directive_for_fitness_eval = NUM_TACTICAL_DIRECTIVES; // A default/invalid state
+
+   // RL Aiming specific initializations
+   pBot->current_aiming_episode_data.clear();
+   pBot->aiming_episode_step_count = 0;
+   pBot->f_next_rl_aim_action_time = gpGlobals->time;
 }
 
 
@@ -909,6 +915,16 @@ void BotCreate( edict_t *pPlayer, const char *arg1, const char *arg2,
       // f_next_tactical_nn_eval_time is set in BotSpawnInit, but set here too for first creation before first spawn
       pBot->f_next_tactical_nn_eval_time = gpGlobals->time + TACTICAL_NN_EVAL_INTERVAL + RANDOM_FLOAT(0,1.5f);
 
+      // Initialize RL Aiming specific fields
+      pBot->aiming_nn_initialized = false; // Will be true if loaded from persistence or initialized below
+      pBot->current_aiming_episode_data.clear();
+      pBot->aiming_episode_step_count = 0;
+      pBot->f_next_rl_aim_action_time = gpGlobals->time;
+
+      if (!pBot->aiming_nn_initialized) { // If persistence didn't load it
+          RL_NN_Initialize_Aiming(&pBot->aiming_rl_nn, RL_AIMING_STATE_SIZE, RL_AIMING_HIDDEN_LAYER_SIZE, RL_AIMING_OUTPUT_SIZE, true, NULL);
+          pBot->aiming_nn_initialized = true;
+      }
 
       pBot->f_start_vote_time = gpGlobals->time + RANDOM_LONG(120, 600);
       pBot->vote_in_progress = FALSE;

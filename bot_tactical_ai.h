@@ -38,7 +38,8 @@ typedef enum {
     OBJ_TYPE_ARMOR_REFILL_STATION,  // Specific type for HEV chargers
     OBJ_TYPE_AMMO_REFILL_POINT,   // Could be for ammo packs if not covered by RESOURCE_NODE
     OBJ_TYPE_PRESSABLE_BUTTON,    // func_button or similar
-    OBJ_TYPE_DOOR_OBSTACLE        // A door that needs opening to progress
+    OBJ_TYPE_DOOR_OBSTACLE,       // A door that needs opening to progress
+    OBJ_TYPE_WEAPON_SPAWN         // For a weapon pickup location
     // Add more as concepts develop
 } ObjectiveType_e;
 

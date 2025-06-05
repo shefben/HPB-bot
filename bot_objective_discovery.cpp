@@ -78,24 +78,43 @@ void ObjectiveDiscovery_LevelInit() {
             cand.current_owner_team = -1;
             cand.learned_activation_method = ACT_UNKNOWN;
             cand.last_positive_correlation_update_time = 0.0f;
+
+            // Initialize new semantic fields
+            cand.gives_health_or_armor = false;
+            cand.triggers_another_entity_event = false;
+            memset(cand.primary_correlated_message_keyword, 0, sizeof(cand.primary_correlated_message_keyword));
+
+            // Heuristics for waypoint-based candidates (less common to have specific entity classnames here)
+            // These might be more effective if waypoint flags could imply these properties.
+            // For now, relying on the generic initialization for "waypoint_area".
+            if (strcmp(cand.entity_classname, "waypoint_area") == 0) {
+                if ((waypoints[i].flags & W_FL_HEALTH) || (waypoints[i].flags & W_FL_ARMOR)) {
+                    cand.gives_health_or_armor = true;
+                }
+                // Waypoints themselves don't typically "trigger" events like buttons.
+            }
+            cand.has_been_shared_as_confirmed = false; // Initialize new field
+
             g_candidate_objectives.push_back(cand);
         }
     }
 }
 
+// Updated signature to include direct link parameters
 void AddGameEvent(GameEventType_e type, float timestamp,
-                  int team1, int team2, int candidate_id,
-                  int player_edict_idx, float val_float, int val_int, const char* message) {
+                  int team1, int team2, int associated_candidate_id,
+                  int player_edict_idx, float val_float, int val_int, const char* message,
+                  bool is_direct_link = false, int direct_link_obj_id = -1) {
     if (g_game_event_log.size() >= MAX_GAME_EVENTS_LOG_SIZE) {
         g_game_event_log.pop_front();
     }
     GameEvent_t event;
-    memset(&event, 0, sizeof(GameEvent_t));
+    memset(&event, 0, sizeof(GameEvent_t)); // Important to zero out all fields, including new ones
     event.type = type;
     event.timestamp = timestamp;
     event.primarily_involved_team_id = team1;
     event.secondary_involved_team_id = team2;
-    event.candidate_objective_id = candidate_id;
+    event.candidate_objective_id = associated_candidate_id; // General association
     event.involved_player_user_id = player_edict_idx;
     event.event_value_float = val_float;
     event.event_value_int = val_int;
@@ -103,6 +122,9 @@ void AddGameEvent(GameEventType_e type, float timestamp,
         strncpy(event.event_message_text, message, sizeof(event.event_message_text) - 1);
         event.event_message_text[sizeof(event.event_message_text) - 1] = '\0';
     }
+    // Assign new direct consequence fields
+    event.is_direct_consequence_link = is_direct_link;
+    event.directly_linked_candidate_id = direct_link_obj_id;
 
     // Update fitness stats based on this event
     if (event.involved_player_user_id != -1) {
@@ -113,13 +135,32 @@ void AddGameEvent(GameEventType_e type, float timestamp,
         }
     } else if (event.primarily_involved_team_id != -1) {
         if (event.type == EVENT_ROUND_OUTCOME || event.type == EVENT_SCORE_CHANGED) {
-            for (int i=0; i < 32; ++i) {
+            for (int i=0; i < 32; ++i) { // Assuming 32 is max_bots
                 if (bots[i].is_used && bots[i].bot_team == event.primarily_involved_team_id) {
                     NE_UpdateFitnessStatsOnEvent(&bots[i], &event, &GetGlobalTacticalState());
                 }
             }
         }
     }
+
+    // Process internal share events before adding to log to prevent a bot from processing its own immediate share.
+    if (event.type == EVENT_INTERNAL_OBJECTIVE_SHARE) {
+        for (int i = 0; i < 32; ++i) { // Assuming 32 is max_bots
+            if (bots[i].is_used && bots[i].bot_team == event.primarily_involved_team_id) {
+                // Skip if the event was "sourced" by a player (event.involved_player_user_id != -1)
+                // and that player is this bot. System-generated shares (player_user_id == -1) are processed by all.
+                if (event.involved_player_user_id != -1 && ENTINDEX(bots[i].pEdict) == event.involved_player_user_id) {
+                    continue;
+                }
+                ObjectiveDiscovery_ProcessSharedObjectiveData(&bots[i],
+                                                            event.associated_candidate_id, // This is the unique_id of the objective
+                                                            (ObjectiveType_e)event.event_value_int,
+                                                            event.event_value_float,
+                                                            event.event_message_text); // Keyword is in message_text
+            }
+        }
+    }
+
     g_game_event_log.push_back(event);
 }
 
@@ -178,6 +219,30 @@ void ObjectiveDiscovery_UpdatePeriodic() {
                     cand_new.current_owner_team = -1;
                     cand_new.learned_activation_method = ACT_UNKNOWN;
                     cand_new.last_positive_correlation_update_time = 0.0f;
+
+                    // Initialize new semantic fields for dynamic candidates
+                    cand_new.gives_health_or_armor = false;
+                    cand_new.triggers_another_entity_event = false;
+                    memset(cand_new.primary_correlated_message_keyword, 0, sizeof(cand_new.primary_correlated_message_keyword));
+
+                    // Initial heuristic for triggers_another_entity_event based on classname:
+                    if (strlen(cand_new.entity_classname) > 0) {
+                        if (strcmp(cand_new.entity_classname, "func_button") == 0 ||
+                            strcmp(cand_new.entity_classname, "func_platrot") == 0 ||
+                            strcmp(cand_new.entity_classname, "momentary_rot_button") == 0 ||
+                            strcmp(cand_new.entity_classname, "multi_source") == 0) {
+                            cand_new.triggers_another_entity_event = true;
+                        }
+                        // Initial heuristic for gives_health_or_armor
+                        if (strcmp(cand_new.entity_classname, "item_healthkit") == 0 ||
+                            strcmp(cand_new.entity_classname, "item_battery") == 0 ||
+                            strcmp(cand_new.entity_classname, "item_armor") == 0 ||
+                            strcmp(cand_new.entity_classname, "func_healthcharger") == 0 ||
+                            strcmp(cand_new.entity_classname, "func_recharge") == 0) {
+                            cand_new.gives_health_or_armor = true;
+                        }
+                    }
+
                     g_candidate_objectives.push_back(cand_new);
                     pCand = &g_candidate_objectives.back();
                     existing_candidate_unique_id = cand_new.unique_id;
@@ -239,6 +304,30 @@ void ObjectiveDiscovery_UpdatePeriodic() {
                     cand_new.current_owner_team = -1;
                     cand_new.learned_activation_method = ACT_UNKNOWN;
                     cand_new.last_positive_correlation_update_time = 0.0f;
+
+                    // Initialize new semantic fields for dynamic candidates from touch
+                    cand_new.gives_health_or_armor = false;
+                    cand_new.triggers_another_entity_event = false;
+                    memset(cand_new.primary_correlated_message_keyword, 0, sizeof(cand_new.primary_correlated_message_keyword));
+
+                    // Initial heuristic for triggers_another_entity_event based on classname:
+                    if (strlen(cand_new.entity_classname) > 0) {
+                        if (strcmp(cand_new.entity_classname, "func_button") == 0 ||
+                            strcmp(cand_new.entity_classname, "func_platrot") == 0 ||
+                            strcmp(cand_new.entity_classname, "momentary_rot_button") == 0 ||
+                             strcmp(cand_new.entity_classname, "multi_source") == 0) {
+                            cand_new.triggers_another_entity_event = true;
+                        }
+                        // Initial heuristic for gives_health_or_armor
+                        if (strcmp(cand_new.entity_classname, "item_healthkit") == 0 ||
+                            strcmp(cand_new.entity_classname, "item_battery") == 0 ||
+                            strcmp(cand_new.entity_classname, "item_armor") == 0 ||
+                            strcmp(cand_new.entity_classname, "func_healthcharger") == 0 ||
+                            strcmp(cand_new.entity_classname, "func_recharge") == 0) {
+                            cand_new.gives_health_or_armor = true;
+                        }
+                    }
+
                     g_candidate_objectives.push_back(cand_new);
                     pCand = &g_candidate_objectives.back();
                     AddGameEvent(EVENT_PLAYER_TOUCHED_ENTITY, gpGlobals->time, UTIL_GetTeam(pPlayer), -1, pCand->unique_id, ENTINDEX(pPlayer), 0.0f, 0, STRING(pNearbyEntity->v.classname));
@@ -268,53 +357,98 @@ bool MessageContainsKeyword(const char* message, const char* keyword) {
 
 void ObjectiveDiscovery_UpdateLearnedTypes() {
     if (!gpGlobals) return;
-    const float SEMANTIC_TYPING_CONFIDENCE_THRESHOLD = 0.6f;
+    const float SEMANTIC_TYPING_CONFIDENCE_THRESHOLD = 0.6f; // Min confidence to attempt specific typing
+    const float HIGH_CONFIDENCE_FOR_OVERWRITE = 0.8f; // Min confidence to overwrite an already specific type
 
     for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
         CandidateObjective_t& cand = g_candidate_objectives[i];
 
         if (cand.confidence_score < SEMANTIC_TYPING_CONFIDENCE_THRESHOLD) {
+            // If confidence is low, maybe revert to a less specific type if it was previously specific.
+            if (cand.learned_objective_type != OBJ_TYPE_NONE &&
+                cand.learned_objective_type != OBJ_TYPE_STRATEGIC_LOCATION &&
+                cand.learned_objective_type != GetInitialLearnedTypeFromWaypoint( (cand.unique_id < num_waypoints && cand.unique_id >=0) ? waypoints[cand.unique_id].flags : 0 ) )
+            {
+                // Revert to its original waypoint-derived type or strategic location
+                if (cand.unique_id < num_waypoints && cand.unique_id >= 0) { // Was waypoint derived
+                    cand.learned_objective_type = GetInitialLearnedTypeFromWaypoint(waypoints[cand.unique_id].flags);
+                } else {
+                    cand.learned_objective_type = OBJ_TYPE_STRATEGIC_LOCATION;
+                }
+            }
             continue;
         }
 
-        if (cand.learned_activation_method == ACT_TOUCH || cand.learned_activation_method == ACT_USE) {
-            if (cand.positive_event_correlations > cand.negative_event_correlations + 5 &&
-                (cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION ||
-                 cand.learned_objective_type == OBJ_TYPE_NONE ||
-                 cand.learned_objective_type == OBJ_TYPE_FLAG ||
-                 cand.learned_objective_type == OBJ_TYPE_FLAG_LIKE_PICKUP)) {
+        // Heuristics to determine/refine learned_objective_type
+        // Only overwrite an already specific type if new evidence is very strong (high confidence)
+        bool can_overwrite_specific_type = (cand.confidence_score >= HIGH_CONFIDENCE_FOR_OVERWRITE);
 
-                int waypoint_idx = cand.unique_id;
-                if (waypoint_idx >=0 && waypoint_idx < num_waypoints && (waypoints[waypoint_idx].flags & W_FL_FLAG) ) {
-                     cand.learned_objective_type = OBJ_TYPE_FLAG;
-                } else if (cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE) {
-                     cand.learned_objective_type = OBJ_TYPE_FLAG_LIKE_PICKUP;
-                }
+        // 1. Based on `gives_health_or_armor` (set by classname heuristic in UpdatePeriodic)
+        if (cand.gives_health_or_armor) {
+            if (strstr(cand.entity_classname, "health") || strstr(cand.entity_classname, "medkit")) {
+                if (cand.learned_objective_type != OBJ_TYPE_HEALTH_REFILL_STATION && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_RESOURCE_NODE || cand.learned_objective_type == OBJ_TYPE_NONE))
+                    cand.learned_objective_type = OBJ_TYPE_HEALTH_REFILL_STATION;
+            } else if (strstr(cand.entity_classname, "armor") || strstr(cand.entity_classname, "battery") || strstr(cand.entity_classname, "recharge")) {
+                if (cand.learned_objective_type != OBJ_TYPE_ARMOR_REFILL_STATION && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_RESOURCE_NODE || cand.learned_objective_type == OBJ_TYPE_NONE))
+                    cand.learned_objective_type = OBJ_TYPE_ARMOR_REFILL_STATION;
+            } else if (cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE) {
+                cand.learned_objective_type = OBJ_TYPE_RESOURCE_NODE; // Generic resource
             }
         }
 
+        // 2. Based on `triggers_another_entity_event` (set by classname heuristic)
+        if (cand.triggers_another_entity_event) {
+             if (cand.learned_objective_type != OBJ_TYPE_PRESSABLE_BUTTON && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE)) {
+                 cand.learned_objective_type = OBJ_TYPE_PRESSABLE_BUTTON;
+                 if (cand.learned_activation_method == ACT_UNKNOWN) cand.learned_activation_method = ACT_USE;
+             }
+        }
+
+        // 3. Based on `entity_classname` for Doors or Weapons
         if (strlen(cand.entity_classname) > 0) {
-            if (strcmp(cand.entity_classname, "func_healthcharger") == 0) {
-                cand.learned_objective_type = OBJ_TYPE_HEALTH_REFILL_STATION;
-            } else if (strcmp(cand.entity_classname, "func_recharge") == 0) {
-                cand.learned_objective_type = OBJ_TYPE_ARMOR_REFILL_STATION;
-            } else if (strncmp(cand.entity_classname, "ammo_", 5) == 0 ||
-                       strcmp(cand.entity_classname, "item_ammobox") == 0 ||
-                       strcmp(cand.entity_classname, "weaponbox") == 0) {
-                cand.learned_objective_type = OBJ_TYPE_AMMO_REFILL_POINT;
-            } else if (strcmp(cand.entity_classname, "item_healthkit")==0 || strcmp(cand.entity_classname, "item_battery")==0){
-                if(cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE) {
-                    cand.learned_objective_type = OBJ_TYPE_RESOURCE_NODE;
+            if (strncmp(cand.entity_classname, "func_door", 9) == 0 || strcmp(cand.entity_classname, "momentary_door") == 0) {
+                if (cand.learned_objective_type != OBJ_TYPE_DOOR_OBSTACLE && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE))
+                    cand.learned_objective_type = OBJ_TYPE_DOOR_OBSTACLE;
+            } else if (strncmp(cand.entity_classname, "weapon_", 7) == 0 || strncmp(cand.entity_classname, "ammo_", 5) == 0) {
+                if (cand.learned_objective_type != OBJ_TYPE_WEAPON_SPAWN && cand.learned_objective_type != OBJ_TYPE_AMMO_REFILL_POINT && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_RESOURCE_NODE || cand.learned_objective_type == OBJ_TYPE_NONE)){
+                    if(strncmp(cand.entity_classname, "weapon_", 7) == 0) cand.learned_objective_type = OBJ_TYPE_WEAPON_SPAWN;
+                    else cand.learned_objective_type = OBJ_TYPE_AMMO_REFILL_POINT;
                 }
-            } else if (strcmp(cand.entity_classname, "func_button") == 0) {
-                cand.learned_objective_type = OBJ_TYPE_PRESSABLE_BUTTON;
-                if (cand.learned_activation_method == ACT_UNKNOWN) cand.learned_activation_method = ACT_USE;
-            } else if (strncmp(cand.entity_classname, "func_door", 9) == 0 || strcmp(cand.entity_classname, "momentary_door") == 0) {
-                cand.learned_objective_type = OBJ_TYPE_DOOR_OBSTACLE;
             }
         }
 
-        if (cand.learned_objective_type == OBJ_TYPE_NONE && cand.confidence_score > SEMANTIC_TYPING_CONFIDENCE_THRESHOLD) {
+        // 4. Based on `primary_correlated_message_keyword` (set in AnalyzeEvents)
+        if (strlen(cand.primary_correlated_message_keyword) > 0) {
+            if (stricmp(cand.primary_correlated_message_keyword, "flag") == 0) {
+                if (cand.learned_objective_type != OBJ_TYPE_FLAG_LIKE_PICKUP && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE))
+                    cand.learned_objective_type = OBJ_TYPE_FLAG_LIKE_PICKUP;
+            } else if (stricmp(cand.primary_correlated_message_keyword, "capture") == 0 || stricmp(cand.primary_correlated_message_keyword, "control") == 0) {
+                if (cand.learned_objective_type != OBJ_TYPE_CONTROL_AREA && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE))
+                    cand.learned_objective_type = OBJ_TYPE_CONTROL_AREA;
+            } else if (stricmp(cand.primary_correlated_message_keyword, "bomb") == 0) {
+                if (cand.learned_objective_type != OBJ_TYPE_BOMB_TARGET && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE))
+                    cand.learned_objective_type = OBJ_TYPE_BOMB_TARGET;
+            } else if (stricmp(cand.primary_correlated_message_keyword, "destroy") == 0 || stricmp(cand.primary_correlated_message_keyword, "damage") == 0) {
+                if (cand.learned_objective_type != OBJ_TYPE_DESTRUCTIBLE_TARGET && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE))
+                    cand.learned_objective_type = OBJ_TYPE_DESTRUCTIBLE_TARGET;
+                    if (cand.learned_activation_method == ACT_UNKNOWN) cand.learned_activation_method = ACT_SHOOT_TARGET; // Assumption
+            }
+        }
+
+        // 5. Based on original waypoint flags if it's a waypoint-derived candidate
+        if (cand.unique_id < num_waypoints && cand.unique_id >= 0) {
+             int waypoint_flags = waypoints[cand.unique_id].flags;
+             if (waypoint_flags & W_FL_FLAG) { // Strong indication from map data
+                 if (cand.learned_objective_type != OBJ_TYPE_FLAG && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE || cand.learned_objective_type == OBJ_TYPE_FLAG_LIKE_PICKUP))
+                     cand.learned_objective_type = OBJ_TYPE_FLAG; // More specific than general pickup
+             } else if (waypoint_flags & W_FL_FLF_CAP) { // Example for another specific flag
+                  if (cand.learned_objective_type != OBJ_TYPE_CAPTURE_POINT && (can_overwrite_specific_type || cand.learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION || cand.learned_objective_type == OBJ_TYPE_NONE || cand.learned_objective_type == OBJ_TYPE_CONTROL_AREA))
+                     cand.learned_objective_type = OBJ_TYPE_CAPTURE_POINT;
+             }
+        }
+
+        // Fallback: if still NONE but high confidence, make it a STRATEGIC_LOCATION
+        if (cand.learned_objective_type == OBJ_TYPE_NONE && cand.confidence_score >= SEMANTIC_TYPING_CONFIDENCE_THRESHOLD) {
             cand.learned_objective_type = OBJ_TYPE_STRATEGIC_LOCATION;
         }
     }
@@ -332,6 +466,107 @@ void ObjectiveDiscovery_AnalyzeEvents() {
 
     std::list<GameEvent_t>::iterator current_event_it = g_game_event_log.begin();
 
+    // --- Direct Consequence Handling Loop ---
+    // This loop iterates events to find direct links.
+    // For full robustness, events processed this way should be flagged (e.g., event.direct_consequence_processed = true)
+    // to avoid reprocessing if AnalyzeEvents is called multiple times over the same log section without clearing.
+    // For this subtask, we'll assume events are new enough or this function is called such that reprocessing is minimal.
+    std::list<GameEvent_t>::iterator direct_link_it = g_game_event_log.begin();
+    // Potentially use g_last_processed_event_it if it's reliably managed to mark the start of "new" events.
+    // For now, iterating a significant portion or all of the log for direct links for simplicity of this step.
+    for (; direct_link_it != g_game_event_log.end(); ++direct_link_it) {
+        if (direct_link_it->is_direct_consequence_link && direct_link_it->directly_linked_candidate_id != -1) {
+            CandidateObjective_t* pCand = GetCandidateObjectiveById(direct_link_it->directly_linked_candidate_id);
+            if (pCand) {
+                bool direct_positive_outcome = false;
+                // Define what constitutes a direct positive outcome based on event type and values
+                if (direct_link_it->type == EVENT_SCORE_CHANGED && direct_link_it->event_value_float > 0) {
+                    direct_positive_outcome = true;
+                } else if (direct_link_it->type == EVENT_IMPORTANT_GAME_MESSAGE) {
+                    // Example: if message indicates "objective captured by team X" and team X is primarily_involved_team_id
+                    // This part requires more sophisticated message parsing logic.
+                    // For now, let's assume EVENT_SCORE_CHANGED is the primary direct indicator.
+                    if (MessageContainsKeyword(direct_link_it->event_message_text, "captured by") ||
+                        MessageContainsKeyword(direct_link_it->event_message_text, "secured by")) {
+                        // Further check if the event's primarily_involved_team_id matches the team that would benefit.
+                        direct_positive_outcome = true;
+                    }
+                }
+                // Add more specific checks for direct positive/negative outcomes from other event types.
+
+                if (direct_positive_outcome) {
+                    pCand->positive_event_correlations += (ROUND_WIN_CORRELATION_BONUS * 2); // Strong boost
+                    pCand->confidence_score += LEARNING_RATE * 5 * (0.95f - pCand->confidence_score); // Move strongly towards high confidence
+                    pCand->last_positive_correlation_update_time = gpGlobals->time;
+                } else {
+                    // Assuming if not clearly positive, it might be neutral or implicitly negative for the linked objective context.
+                    // A more explicit negative check would be better.
+                    pCand->negative_event_correlations += (ROUND_WIN_CORRELATION_BONUS * 2); // Or a smaller penalty if not explicitly negative
+                    pCand->confidence_score += LEARNING_RATE * 5 * (0.05f - pCand->confidence_score); // Move towards low confidence
+                }
+
+                if (pCand->confidence_score > 0.95f) pCand->confidence_score = 0.95f;
+                if (pCand->confidence_score < MIN_CONFIDENCE_THRESHOLD) pCand->confidence_score = MIN_CONFIDENCE_THRESHOLD;
+
+                // Populate primary_correlated_message_keyword
+                if (direct_link_it->event_message_text[0] != '\0' && strlen(pCand->primary_correlated_message_keyword) == 0) {
+                    char temp_msg_copy[128];
+                    strncpy(temp_msg_copy, direct_link_it->event_message_text, sizeof(temp_msg_copy)-1);
+                    temp_msg_copy[sizeof(temp_msg_copy)-1] = '\0';
+
+                    char *first_word = strtok(temp_msg_copy, " .!?,;:()[]{}<>\"'"); // Common delimiters
+                    if (first_word) {
+                        const char* known_keywords[] = {
+                            "flag", "capture", "control", "bomb", "defuse", "rescue",
+                            "deliver", "secure", "destroy", "activate", "objective",
+                            "point", "intel", "briefcase", "keycard" // Added more examples
+                        };
+                        int num_known_keywords = sizeof(known_keywords) / sizeof(known_keywords[0]);
+                        for (int k = 0; k < num_known_keywords; ++k) {
+                            // Using stricmp for case-insensitive comparison if available, else strcasecmp or manual lowercasing.
+                            // Assuming stricmp is available as per thought process.
+                            if (stricmp(first_word, known_keywords[k]) == 0) {
+                                strncpy(pCand->primary_correlated_message_keyword, first_word, sizeof(pCand->primary_correlated_message_keyword) - 1);
+                                pCand->primary_correlated_message_keyword[sizeof(pCand->primary_correlated_message_keyword) - 1] = '\0';
+                                break;
+                            }
+                        }
+                    }
+                }
+                // direct_link_it->direct_consequence_processed = true; // If flag was added to GameEvent_t
+
+                // Check for broadcasting confirmed objective
+                const float SHARE_CONFIDENCE_THRESHOLD = 0.9f;
+                const float SHARE_SPECIFIC_TYPE_CONFIDENCE_THRESHOLD = 0.75f;
+                bool should_share = false;
+
+                if (pCand->confidence_score >= SHARE_CONFIDENCE_THRESHOLD && !pCand->has_been_shared_as_confirmed) {
+                    should_share = true;
+                } else if (pCand->learned_objective_type != OBJ_TYPE_NONE &&
+                           pCand->learned_objective_type != OBJ_TYPE_STRATEGIC_LOCATION && // Is a specific type
+                           pCand->confidence_score >= SHARE_SPECIFIC_TYPE_CONFIDENCE_THRESHOLD &&
+                           !pCand->has_been_shared_as_confirmed) {
+                    should_share = true;
+                }
+
+                if (should_share) {
+                    // For EVENT_INTERNAL_OBJECTIVE_SHARE, event_message_text will store the primary_correlated_message_keyword.
+                    // The AddGameEvent call will then pass this to ObjectiveDiscovery_ProcessSharedObjectiveData.
+                    AddGameEvent(EVENT_INTERNAL_OBJECTIVE_SHARE, gpGlobals->time,
+                                 pCand->last_interacting_team, /* team2 */ -1,
+                                 pCand->unique_id, /* player_edict_idx (source bot) */ -1,
+                                 pCand->confidence_score, (int)pCand->learned_objective_type,
+                                 pCand->primary_correlated_message_keyword, // Pass keyword as message
+                                 true, pCand->unique_id);  // Direct link to itself for identification, though not strictly needed for share events
+
+                    pCand->has_been_shared_as_confirmed = true;
+                }
+            }
+        }
+    }
+
+
+    // --- Windowed Correlation Loop (existing logic with temporal weighting) ---
     for (current_event_it = g_game_event_log.begin(); current_event_it != g_game_event_log.end(); ++current_event_it) {
         GameEvent_t& outcome_event = *current_event_it;
 
@@ -344,8 +579,8 @@ void ObjectiveDiscovery_AnalyzeEvents() {
                 if (outcome_event.event_value_float > 0) positive_outcome_for_team = true;
                 else if (outcome_event.event_value_float < 0) negative_outcome_for_team = true;
             } else if (outcome_event.type == EVENT_ROUND_OUTCOME) {
-                if (outcome_event.event_value_int == 1) positive_outcome_for_team = true;
-                else if (outcome_event.event_value_int == -1) negative_outcome_for_team = true;
+                if (outcome_event.event_value_int == 1) positive_outcome_for_team = true; // Win for primarily_involved_team_id
+                else if (outcome_event.event_value_int == -1) negative_outcome_for_team = true; // Loss for primarily_involved_team_id
             }
 
             if (!positive_outcome_for_team && !negative_outcome_for_team) continue;
@@ -365,17 +600,32 @@ void ObjectiveDiscovery_AnalyzeEvents() {
 
                     CandidateObjective_t* pCandidate = GetCandidateObjectiveById(interaction_event.candidate_objective_id);
                     if (pCandidate) {
-                        int correlation_increment = 1;
-                        if (outcome_event.type == EVENT_ROUND_OUTCOME && positive_outcome_for_team) {
-                           correlation_increment += ROUND_WIN_CORRELATION_BONUS;
+                        // Temporal Proximity Weighting
+                        float time_difference = outcome_event.timestamp - interaction_event.timestamp;
+                        float temporal_weight_multiplier = 1.0f;
+                        if (time_difference <= 3.0f) {
+                            temporal_weight_multiplier = 2.0f;
+                        } else if (time_difference <= 8.0f) {
+                            temporal_weight_multiplier = 1.0f;
+                        } else {
+                            temporal_weight_multiplier = 0.5f;
                         }
 
+                        int base_correlation_increment = 1;
+                        if (outcome_event.type == EVENT_ROUND_OUTCOME && positive_outcome_for_team) {
+                           base_correlation_increment += ROUND_WIN_CORRELATION_BONUS;
+                        }
+
+                        int actual_increment = (int)(base_correlation_increment * temporal_weight_multiplier);
+                        if (actual_increment < 1 && base_correlation_increment >=1) actual_increment = 1;
+
                         if (positive_outcome_for_team) {
-                            pCandidate->positive_event_correlations += correlation_increment;
-                            pCandidate->last_positive_correlation_update_time = gpGlobals->time;
+                            pCandidate->positive_event_correlations += actual_increment;
+                            pCandidate->last_positive_correlation_update_time = gpGlobals->time; // Mark update time
                             pCandidate->confidence_score += LEARNING_RATE * (1.0f - pCandidate->confidence_score);
                         } else if (negative_outcome_for_team) {
-                            pCandidate->negative_event_correlations += correlation_increment;
+                            // For negative outcomes for the interacting team, they get negative correlations
+                            pCandidate->negative_event_correlations += actual_increment;
                             pCandidate->confidence_score += LEARNING_RATE * (0.0f - pCandidate->confidence_score);
                         }
 
@@ -387,6 +637,7 @@ void ObjectiveDiscovery_AnalyzeEvents() {
         }
     }
 
+    // Confidence Decay (existing logic)
     for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
         CandidateObjective_t& cand = g_candidate_objectives[i];
         if (cand.last_positive_correlation_update_time > 0.0f &&
@@ -521,6 +772,55 @@ CandidateObjective_t* GetCandidateObjectiveById(int unique_id) {
         }
     }
     return NULL;
+}
+
+
+#define LEARNING_RATE_FOR_SHARED_INFO 0.1f // How much to nudge based on shared info
+
+void ObjectiveDiscovery_ProcessSharedObjectiveData(bot_t* pReceivingBot, int shared_candidate_id,
+                                                   ObjectiveType_e shared_type, float shared_confidence,
+                                                   const char* shared_keyword) {
+    if (!pReceivingBot || !pReceivingBot->is_used || !pReceivingBot->nn_initialized) return;
+
+    CandidateObjective_t* pLocalCand = GetCandidateObjectiveById(shared_candidate_id);
+    if (pLocalCand) {
+        // Nudge confidence only if shared info is more confident
+        if (shared_confidence > pLocalCand->confidence_score) {
+           pLocalCand->confidence_score += LEARNING_RATE_FOR_SHARED_INFO * (shared_confidence - pLocalCand->confidence_score);
+           if (pLocalCand->confidence_score > 0.95f) pLocalCand->confidence_score = 0.95f; // Cap
+        }
+
+        // Update learned type if shared is more specific or significantly more confident
+        bool shared_type_is_specific = (shared_type != OBJ_TYPE_NONE && shared_type != OBJ_TYPE_STRATEGIC_LOCATION);
+        bool local_type_is_generic = (pLocalCand->learned_objective_type == OBJ_TYPE_NONE || pLocalCand->learned_objective_type == OBJ_TYPE_STRATEGIC_LOCATION);
+
+        if (shared_type_is_specific && (local_type_is_generic || shared_confidence > pLocalCand->confidence_score + 0.2f )) {
+            // If local type is generic, or if shared type is specific and the shared confidence is significantly higher
+            // (e.g. shared info is much more certain about a specific type than local generic assessment)
+             if (shared_confidence >= pLocalCand->confidence_score || local_type_is_generic) { // Extra check to prefer more confident specific typing
+                pLocalCand->learned_objective_type = shared_type;
+             }
+        }
+
+        // Update keyword if local is empty and shared is not
+        if (shared_keyword && shared_keyword[0] != '\0' && pLocalCand->primary_correlated_message_keyword[0] == '\0') {
+           strncpy(pLocalCand->primary_correlated_message_keyword, shared_keyword, sizeof(pLocalCand->primary_correlated_message_keyword) -1 );
+           pLocalCand->primary_correlated_message_keyword[sizeof(pLocalCand->primary_correlated_message_keyword)-1] = '\0';
+        }
+
+        // Example debug print (could be behind a cvar)
+        // if (pReceivingBot->pEdict == gpGlobals->player_edicts[1]) { // If it's the listen server player/bot
+        //     ALERT(at_console, "Bot %s (Idx %d) received shared info for Obj %d. New Conf: %.2f, Type: %s, Keyword: %s\n",
+        //           pReceivingBot->name, (int)(pReceivingBot - bots), shared_candidate_id,
+        //           pLocalCand->confidence_score, ObjectiveTypeToString(pLocalCand->learned_objective_type),
+        //           pLocalCand->primary_correlated_message_keyword);
+        // }
+
+    } else {
+        // Bot doesn't know this candidate yet.
+        // Future enhancement: Could add it if confidence is very high and enough info (like location) is shared.
+        // For now, only update existing known candidates.
+    }
 }
 
 [end of bot_objective_discovery.cpp]

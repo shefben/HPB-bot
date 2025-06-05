@@ -53,7 +53,8 @@ typedef enum {
     EVENT_PLAYER_ENTERED_AREA,    // Player entered a notable area (e.g., near a candidate objective)
     EVENT_PLAYER_DIED_NEAR_CANDIDATE, // Player died near a candidate objective
     EVENT_IMPORTANT_GAME_MESSAGE, // A text message that might be relevant (e.g., "Bomb Planted")
-    EVENT_CANDIDATE_STATE_CHANGE  // A candidate objective itself changed state (e.g. a door opened)
+    EVENT_CANDIDATE_STATE_CHANGE,  // A candidate objective itself changed state (e.g. a door opened)
+    EVENT_INTERNAL_OBJECTIVE_SHARE // An event logged by a bot when it confirms an objective
     // Add more event types as needed
 } GameEventType_e;
 
@@ -80,6 +81,12 @@ typedef struct {
     std::vector<int> recent_interacting_teams;                // Teams of last N players/interactions
     float last_positive_correlation_update_time; // Time of last positive reinforcement for decay logic
 
+    // New fields for richer semantic feature tracking
+    bool gives_health_or_armor;
+    bool triggers_another_entity_event;
+    char primary_correlated_message_keyword[32];
+    bool has_been_shared_as_confirmed; // To prevent spamming share events
+
 } CandidateObjective_t;
 
 
@@ -98,6 +105,10 @@ typedef struct {
     int event_value_int;                // e.g., win=1, loss=-1, draw=0 for ROUND_OUTCOME for primarily_involved_team_id
     char event_message_text[128];       // For EVENT_IMPORTANT_GAME_MESSAGE or other relevant text
 
+    // New fields for advanced correlation
+    bool is_direct_consequence_link;    // True if this event directly confirms an objective interaction's outcome
+    int directly_linked_candidate_id; // unique_id of the CandidateObjective_t if this is a direct link
+
 } GameEvent_t;
 
 // Global data extern declarations
@@ -109,14 +120,20 @@ extern int g_dynamic_candidate_id_counter;
 void ObjectiveDiscovery_LevelInit();
 void ObjectiveDiscovery_UpdatePeriodic();
 void ObjectiveDiscovery_AnalyzeEvents();
+// Updated AddGameEvent signature
 void AddGameEvent(GameEventType_e type, float timestamp,
-                  int team1, int team2, int candidate_id,
-                  int player_edict_idx, float val_float, int val_int, const char* message);
+                  int team1, int team2, int associated_candidate_id,
+                  int player_edict_idx, float val_float, int val_int, const char* message,
+                  bool is_direct_link = false, int direct_link_obj_id = -1);
 CandidateObjective_t* GetCandidateObjectiveById(int unique_id);
 const char* ObjectiveTypeToString(ObjectiveType_e obj_type);
 const char* GameEventTypeToString(GameEventType_e event_type);
 void ObjectiveDiscovery_DrawDebugVisuals(edict_t* pViewPlayer);
-const char* ActivationMethodToString(ActivationMethod_e act_meth); // New prototype
+const char* ActivationMethodToString(ActivationMethod_e act_meth);
+
+// Forward declare bot_t for the new function prototype if not already available
+struct bot_t;
+void ObjectiveDiscovery_ProcessSharedObjectiveData(bot_t* pReceivingBot, int shared_candidate_id, ObjectiveType_e shared_type, float shared_confidence, const char* shared_keyword);
 
 
 #endif // BOT_OBJECTIVE_DISCOVERY_H

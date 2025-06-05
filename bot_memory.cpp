@@ -8,6 +8,7 @@
 #include "bot.h"        // For bot_t, bots array
 #include "bot_objective_discovery.h" // For g_candidate_objectives, CandidateObjective_t, GetCandidateObjectiveById
 #include "bot_neuro_evolution.h"   // For NN_FlattenWeights, NN_Initialize, and NN constants
+#include "bot_rl_aiming.h"         // For RL Aiming NN functions and constants
 
 #include <string.h> // For strncpy, memset
 #include <stdio.h> // For FILE operations
@@ -208,13 +209,22 @@ void SaveBotMemory(const char *filename) {
                 NN_FlattenWeights(&current_bot->tactical_nn, pbd.tactical_nn_weights);
             } else {
                 pbd.has_saved_nn_weights = false;
-                memset(pbd.tactical_nn_weights, 0, sizeof(pbd.tactical_nn_weights)); // Zero out if no weights
+                memset(pbd.tactical_nn_weights, 0, sizeof(pbd.tactical_nn_weights));
+            }
+
+            // Save RL Aiming NN weights
+            if (current_bot->aiming_nn_initialized) {
+                pbd.has_saved_aiming_nn = true;
+                RL_NN_FlattenWeights_Aiming(&current_bot->aiming_rl_nn, pbd.aiming_rl_nn_weights);
+            } else {
+                pbd.has_saved_aiming_nn = false;
+                memset(pbd.aiming_rl_nn_weights, 0, sizeof(pbd.aiming_rl_nn_weights));
             }
 
         } else {
-            memset(&pbd, 0, sizeof(persistent_bot_data_t));
+            memset(&pbd, 0, sizeof(persistent_bot_data_t)); // Zero out the whole struct
             pbd.is_used_in_save = false;
-            pbd.has_saved_nn_weights = false; // Ensure this is false for unused slots
+            // All bools like has_saved_nn_weights and has_saved_aiming_nn will be false due to memset.
         }
 
         if (fwrite(&pbd, sizeof(persistent_bot_data_t), 1, fp) != 1) {
@@ -406,10 +416,25 @@ void LoadBotMemory(const char *filename) {
                 target_bot->nn_initialized = false;
             }
 
+            // Load RL Aiming NN weights if available
+            if (pbd.has_saved_aiming_nn) {
+                RL_NN_Initialize_Aiming(&target_bot->aiming_rl_nn,
+                                      RL_AIMING_STATE_SIZE,
+                                      RL_AIMING_HIDDEN_LAYER_SIZE,
+                                      RL_AIMING_OUTPUT_SIZE,
+                                      false, // initialize_with_random_weights = false
+                                      pbd.aiming_rl_nn_weights); // initial_weights_data
+                target_bot->aiming_nn_initialized = true;
+            } else {
+                target_bot->aiming_nn_initialized = false;
+            }
+
         } else {
-            if (i < 32 && !bots[i].is_used) {
+            // If slot wasn't used in save, ensure flags are false
+            if (i < 32 && !bots[i].is_used) { // Check against current bot usage, though this loop is for all saved slots
                  bots[i].loaded_from_persistence = false;
-                 bots[i].nn_initialized = false; // Ensure not marked as initialized if slot not used in save
+                 bots[i].nn_initialized = false;
+                 bots[i].aiming_nn_initialized = false;
             }
         }
     }

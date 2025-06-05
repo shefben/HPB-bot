@@ -10,6 +10,7 @@
 #define BOT_H
 
 #include "bot_neuro_evolution.h" // For TacticalNeuralNetwork_t
+#include "bot_rl_aiming.h"       // For RL Aiming structures
 
 // stuff for Win32 vs. Linux builds
 
@@ -326,6 +327,13 @@ typedef struct
    float current_eval_damage_dealt;                  // Might be harder to track accurately without engine support
    float current_eval_survival_start_time;           // Time evaluation period started or bot spawned
    TacticalDirective last_chosen_directive_for_fitness_eval; // Directive active around key events
+
+   // --- Fields for Reinforcement Learning (Aiming) ---
+   RL_Aiming_NN_t aiming_rl_nn;                     // Neural network for aiming
+   bool aiming_nn_initialized;                      // Flag if aiming NN has been initialized
+   std::vector<RL_Aiming_Experience_t> current_aiming_episode_data; // Stores (s,a,r,log_p) tuples for current episode
+   int aiming_episode_step_count;                   // Number of steps taken in current aiming episode
+   float f_next_rl_aim_action_time;                 // Time when the next RL aiming action can be taken
 } bot_t;
 
 

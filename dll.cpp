@@ -107,6 +107,13 @@ cvar_t bot_ne_num_elites = {"bot_ne_num_elites", "2", FCVAR_SERVER}; // Note: NE
 cvar_t bot_ne_generation_period = {"bot_ne_generation_period", "180.0", FCVAR_SERVER}; // Seconds
 cvar_t bot_ne_min_population = {"bot_ne_min_population", "4", FCVAR_SERVER};
 
+// CVars for RL Aiming Parameters
+cvar_t bot_rl_aim_learning_rate = {"bot_rl_aim_learning_rate", "0.001", FCVAR_SERVER};
+cvar_t bot_rl_aim_discount_factor = {"bot_rl_aim_discount_factor", "0.99", FCVAR_SERVER};
+cvar_t bot_rl_aim_exploration_epsilon = {"bot_rl_aim_exploration_epsilon", "0.1", FCVAR_SERVER};
+cvar_t bot_rl_aim_episode_max_steps = {"bot_rl_aim_episode_max_steps", "100", FCVAR_SERVER};
+cvar_t bot_rl_aim_action_interval = {"bot_rl_aim_action_interval", "0.1", FCVAR_SERVER}; // Interval for RL actions
+
 edict_t *pent_info_tfdetect = NULL;
 edict_t *pent_info_ctfdetect = NULL;
 edict_t *pent_info_frontline = NULL;
@@ -188,6 +195,13 @@ void GameDLLInit( void )
    CVAR_REGISTER(&bot_ne_num_elites);
    CVAR_REGISTER(&bot_ne_generation_period);
    CVAR_REGISTER(&bot_ne_min_population);
+
+   // Register RL Aiming CVars
+   CVAR_REGISTER(&bot_rl_aim_learning_rate);
+   CVAR_REGISTER(&bot_rl_aim_discount_factor);
+   CVAR_REGISTER(&bot_rl_aim_exploration_epsilon);
+   CVAR_REGISTER(&bot_rl_aim_episode_max_steps);
+   CVAR_REGISTER(&bot_rl_aim_action_interval);
 
    RETURN_META (MRES_IGNORED);
 }
@@ -381,6 +395,67 @@ void ClientCommand( edict_t *pEntity )
           } else {
               ClientPrint(pEntity, HUD_PRINTCONSOLE, "Bot not found or NN not initialized.\n");
           }
+          RETURN_META(MRES_SUPERCEDE);
+      }
+      // RL Aiming Debug Commands
+      else if (FStrEq(pcmd, "bot_rl_print_aim_stats"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Command only for listen server admin or server console.\n"); RETURN_META(MRES_SUPERCEDE); }
+          const char* arg_bot_id = CMD_ARGV(1);
+          if (!arg_bot_id || arg_bot_id[0] == '\0') { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Usage: bot_rl_print_aim_stats <bot_idx_or_name>\n"); RETURN_META(MRES_SUPERCEDE); }
+
+          bot_t* pFoundBot = NULL;
+          char* endptr; long val = strtol(arg_bot_id, &endptr, 10);
+          if (*endptr == '\0' && val >= 0 && val < 32 && bots[val].is_used) { pFoundBot = &bots[val]; }
+          else { for(int i=0; i<32; ++i) { if(bots[i].is_used && stricmp(bots[i].name, arg_bot_id) == 0) { pFoundBot = &bots[i]; break; } } }
+
+          if (pFoundBot && pFoundBot->aiming_nn_initialized && !pFoundBot->current_aiming_episode_data.empty()) {
+              char msg_rl_stats[512];
+              const RL_Aiming_Experience_t& last_exp = pFoundBot->current_aiming_episode_data.back();
+              sprintf(msg_rl_stats, "Bot %s RL Aim Stats (Last Step):\n  State (first 3): %.2f, %.2f, %.2f ...\n  Action: %s (LogProb: %.3f)\n  Reward: %.2f\n  Episode Steps: %d\n",
+                      pFoundBot->name, last_exp.state_features[0], last_exp.state_features[1], last_exp.state_features[2],
+                      RL_AimingActionToString(last_exp.action_taken), last_exp.log_prob_action,
+                      last_exp.reward_received, pBot->aiming_episode_step_count); // Use pBot for aiming_episode_step_count if it's the target bot
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, msg_rl_stats);
+          } else { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Bot not found, Aiming NN not init, or no episode data.\n"); }
+          RETURN_META(MRES_SUPERCEDE);
+      }
+      else if (FStrEq(pcmd, "bot_rl_print_aim_nn"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Command only for listen server admin or server console.\n"); RETURN_META(MRES_SUPERCEDE); }
+          const char* arg_bot_id = CMD_ARGV(1);
+          if (!arg_bot_id || arg_bot_id[0] == '\0') { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Usage: bot_rl_print_aim_nn <bot_idx_or_name>\n"); RETURN_META(MRES_SUPERCEDE); }
+
+          bot_t* pFoundBot = NULL;
+          char* endptr; long val = strtol(arg_bot_id, &endptr, 10);
+          if (*endptr == '\0' && val >= 0 && val < 32 && bots[val].is_used) { pFoundBot = &bots[val]; }
+          else { for(int i=0; i<32; ++i) { if(bots[i].is_used && stricmp(bots[i].name, arg_bot_id) == 0) { pFoundBot = &bots[i]; break; } } }
+
+          if (pFoundBot && pFoundBot->aiming_nn_initialized) {
+              char msg_rl_nn[256];
+              RL_Aiming_NN_t* nn = &pFoundBot->aiming_rl_nn;
+              sprintf(msg_rl_nn, "RL Aim NN Info for Bot %s:\nInputs: %d, Hidden: %d, Outputs: %d\n",
+                      pFoundBot->name, nn->num_input_neurons, nn->num_hidden_neurons, nn->num_output_neurons);
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, msg_rl_nn);
+              // Could add weight sums here too
+          } else { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Bot not found or Aiming NN not initialized.\n"); }
+          RETURN_META(MRES_SUPERCEDE);
+      }
+      else if (FStrEq(pcmd, "bot_rl_force_aim_update"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Command only for listen server admin or server console.\n"); RETURN_META(MRES_SUPERCEDE); }
+          const char* arg_bot_id = CMD_ARGV(1);
+          if (!arg_bot_id || arg_bot_id[0] == '\0') { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Usage: bot_rl_force_aim_update <bot_idx_or_name>\n"); RETURN_META(MRES_SUPERCEDE); }
+
+          bot_t* pFoundBot = NULL;
+          char* endptr; long val = strtol(arg_bot_id, &endptr, 10);
+          if (*endptr == '\0' && val >= 0 && val < 32 && bots[val].is_used) { pFoundBot = &bots[val]; }
+          else { for(int i=0; i<32; ++i) { if(bots[i].is_used && stricmp(bots[i].name, arg_bot_id) == 0) { pFoundBot = &bots[i]; break; } } }
+
+          if (pFoundBot && pFoundBot->aiming_nn_initialized && !pFoundBot->current_aiming_episode_data.empty()) {
+              RL_UpdatePolicyNetwork_REINFORCE(pFoundBot, bot_rl_aim_learning_rate.value, bot_rl_aim_discount_factor.value);
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Forced RL Aim NN update for bot.\n");
+          } else { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Bot not found, NN not init, or no episode data to update from.\n"); }
           RETURN_META(MRES_SUPERCEDE);
       }
    }

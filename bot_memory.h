@@ -6,6 +6,7 @@
 #include "bot_objective_discovery.h" // For ObjectiveType_e, ActivationMethod_e (used in SavedDiscoveredObjective_t)
                                      // This also implies bot_tactical_ai.h is included by one of these, for the base ObjectiveType_e
 #include "extdll.h"              // For Vector
+#include "bot_rl_aiming.h"       // For MAX_RL_AIMING_NN_WEIGHT_SIZE
 
 // Header for the consolidated bot memory file
 typedef struct {
@@ -45,6 +46,10 @@ typedef struct {
     // Added for NN persistence (Neuro-Evolution for Tactics - Phase 1, Step 5)
     bool has_saved_nn_weights;
     float tactical_nn_weights[MAX_NN_WEIGHT_SIZE]; // MAX_NN_WEIGHT_SIZE from bot_neuro_evolution.h
+
+    // Added for RL Aiming NN persistence
+    bool has_saved_aiming_nn;
+    float aiming_rl_nn_weights[MAX_RL_AIMING_NN_WEIGHT_SIZE];
 
 } persistent_bot_data_t;
 
