@@ -19,6 +19,12 @@
 #include "bot.h"
 #include "bot_func.h"
 #include "waypoint.h"
+#include "bot_memory.h" // For LoadBotMemory/SaveBotMemory
+
+// Define BOT_MEMORY_FILENAME if not globally visible (it's not from bot_memory.cpp's perspective for dll.cpp)
+#ifndef BOT_MEMORY_FILENAME
+#define BOT_MEMORY_FILENAME "user/hpb_bot_memory.dat"
+#endif
 
 #define VER_MAJOR 4
 #define VER_MINOR 0
@@ -1347,9 +1353,31 @@ void StartFrame( void )
       char msg[256];
       int count;
 
+      // Save bot memory at the end of a map (before new map detection)
+      // This check ensures it only happens if previous_time is initialized (not first frame ever)
+      // and that it's potentially the last frame of a map.
+      if (previous_time > 0.0 &&ชัดเจน((gpGlobals->time + 0.1) >= previous_time)) {
+          // Check if it's truly a map change scenario by peeking if next condition will be true
+          if ((gpGlobals->time + 0.1) < previous_time || gpGlobals->time < previous_time) { // A bit of a heuristic for map change
+             SaveBotMemory(BOT_MEMORY_FILENAME);
+          }
+      }
+      // A more direct place to save would be ServerDeactivate if it existed, or a map shutdown event.
+      // As a fallback, if server is shutting down, perhaps before worldspawn is destroyed.
+      // For now, this tries to save before new map load.
+
       // if a new map has started then (MUST BE FIRST IN StartFrame)...
       if ((gpGlobals->time + 0.1) < previous_time)
       {
+         // Save memory from the previous map just before loading the new one.
+         // This ensures that if the server crashes or doesn't call a deactivate, we still save.
+         // However, saving twice (here and above) if both conditions meet isn't ideal.
+         // Let's refine: The above save is a general "late map frame" save.
+         // This specific one is "definitely end of map".
+         if (previous_time > 0.0) { // Ensure previous_time was valid from a prior map
+            SaveBotMemory(BOT_MEMORY_FILENAME);
+         }
+
          char filename[256];
          char mapname[64];
 

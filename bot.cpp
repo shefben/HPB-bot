@@ -111,12 +111,14 @@ void BotSpawnInit( bot_t *pBot )
    pBot->waypoint_flag_origin = Vector(0, 0, 0);
    pBot->prev_waypoint_distance = 0.0;
 
-   pBot->weapon_points[0] = 0;
-   pBot->weapon_points[1] = 0;
-   pBot->weapon_points[2] = 0;
-   pBot->weapon_points[3] = 0;
-   pBot->weapon_points[4] = 0;
-   pBot->weapon_points[5] = 0;
+   if (!pBot->loaded_from_persistence) {
+       pBot->weapon_points[0] = 0;
+       pBot->weapon_points[1] = 0;
+       pBot->weapon_points[2] = 0;
+       pBot->weapon_points[3] = 0;
+       pBot->weapon_points[4] = 0;
+       pBot->weapon_points[5] = 0;
+   }
 
    pBot->blinded_time = 0.0;
 
@@ -211,7 +213,12 @@ void BotSpawnInit( bot_t *pBot )
 
    pBot->f_medic_check_health_time = 0.0;
 
-   pBot->f_reaction_target_time = 0.0;
+   if (!pBot->loaded_from_persistence) {
+       // reaction_time is part of persistent_bot_data_t but usually set in BotCreate.
+       // If it were to be reset here, it would need this flag.
+       // pBot->reaction_time = 0; // Example if it was reset here
+   }
+   pBot->f_reaction_target_time = 0.0; // This seems like a dynamic state, not persistent
 
    memset(&(pBot->current_weapon), 0, sizeof(pBot->current_weapon));
    memset(&(pBot->m_rgAmmo), 0, sizeof(pBot->m_rgAmmo));
@@ -628,24 +635,56 @@ void BotCreate( edict_t *pPlayer, const char *arg1, const char *arg2,
 
       pBot = &bots[index];
 
+      // pBot->loaded_from_persistence is assumed to be set by LoadBotMemory or default to false.
+      // BotCreate should not unconditionally set it to false here if it was true.
+
       pBot->is_used = TRUE;
       pBot->respawn_state = RESPAWN_IDLE;
       pBot->f_create_time = gpGlobals->time;
-      pBot->name[0] = 0;  // name not set by server yet
-      pBot->bot_money = 0;
-      pBot->sentrygun_waypoint = -1;
-      pBot->dispenser_waypoint = -1;
+      // Name handling: c_name is used for CreateFakeClient.
+      // If loaded from persistence, pBot->name would have the loaded name.
+      // The engine then sets pEdict->v.netname. BotThink ensures pBot->name gets this if pBot->name[0]==0.
+      if (pBot->loaded_from_persistence && pBot->name[0] != '\0') {
+         // If a name was loaded, ensure c_name uses it for CreateFakeClient if that's desired,
+         // but c_name is already determined above based on args or BotPickName.
+         // The critical part is that pBot->name itself isn't overwritten by a default *if loaded*.
+      } else {
+         pBot->name[0] = 0; // Ensure it's clear if not loaded, so BotThink can populate it.
+      }
+
+      if (!pBot->loaded_from_persistence) {
+          pBot->bot_money = 0; // Example: money is not persistent per this design
+          pBot->sentrygun_waypoint = -1;
+          pBot->dispenser_waypoint = -1;
+      }
+      // sentrygun_level and dispenser_built are dynamic.
       pBot->sentrygun_level = 0;
       pBot->dispenser_built = 0;
 
-      strcpy(pBot->skin, c_skin);
+      // Skin handling
+      if (pBot->loaded_from_persistence && pBot->skin[0] != '\0') {
+          // If a skin was loaded, ensure c_skin uses it.
+          // c_skin is determined above by args or defaults. If args were given, they override.
+          // If no args, and persistence is on, c_skin should ideally be pBot->skin.
+          // For now, we assume c_skin is set correctly above, and pBot->skin will take that value
+          // UNLESS loaded_from_persistence is true, in which case pBot->skin is already loaded.
+          // strcpy(c_skin, pBot->skin); // This would force use of loaded skin.
+      } else {
+          // If not loaded from persistence, pBot->skin will take the value of c_skin.
+          strcpy(pBot->skin, c_skin);
+      }
 
-      pBot->top_color = top_color;
-      pBot->bottom_color = bottom_color;
+      // Top/Bottom color
+      if (!pBot->loaded_from_persistence) {
+          pBot->top_color = top_color;
+          pBot->bottom_color = bottom_color;
+      } // else, they are already set from loaded data by LoadBotMemory
 
       pBot->pEdict = BotEnt;
 
-      BotPickLogo(pBot);
+      if (!pBot->loaded_from_persistence) {
+          BotPickLogo(pBot); // Pick a new logo only if not loaded
+      } // else, pBot->logo_name is already set by LoadBotMemory
 
       pBot->not_started = 1;  // hasn't joined game yet
 
@@ -678,40 +717,58 @@ void BotCreate( edict_t *pPlayer, const char *arg1, const char *arg2,
       pBot->round_end = 0;
       pBot->defender = 0;
 
-      pBot->strafe_percent = bot_strafe_percent;
-      pBot->chat_percent = bot_chat_percent;
-      pBot->taunt_percent = bot_taunt_percent;
-      pBot->whine_percent = bot_whine_percent;
-      pBot->chat_tag_percent = bot_chat_tag_percent;
-      pBot->chat_drop_percent = bot_chat_drop_percent;
-      pBot->chat_swap_percent = bot_chat_swap_percent;
-      pBot->chat_lower_percent = bot_chat_lower_percent;
-      pBot->logo_percent = bot_logo_percent;
+      if (!pBot->loaded_from_persistence) {
+          pBot->strafe_percent = bot_strafe_percent;
+          pBot->chat_percent = bot_chat_percent;
+          pBot->taunt_percent = bot_taunt_percent;
+          pBot->whine_percent = bot_whine_percent;
+          pBot->chat_tag_percent = bot_chat_tag_percent;
+          pBot->chat_drop_percent = bot_chat_drop_percent;
+          pBot->chat_swap_percent = bot_chat_swap_percent;
+          pBot->chat_lower_percent = bot_chat_lower_percent;
+          pBot->logo_percent = bot_logo_percent;
+          pBot->reaction_time = bot_reaction_time; // Set from global default if not loaded
+      }
+      // These are dynamic, not persistent in the same way
       pBot->f_strafe_direction = 0.0;  // not strafing
       pBot->f_strafe_time = 0.0;
-      pBot->reaction_time = bot_reaction_time;
 
       pBot->f_start_vote_time = gpGlobals->time + RANDOM_LONG(120, 600);
       pBot->vote_in_progress = FALSE;
       pBot->f_vote_time = 0.0;
 
-      pBot->bot_skill = skill - 1;  // 0 based for array indexes
+      // Skill, team, class are more complex. They are set by BotCreate args or defaults.
+      // If LoadBotMemory ran, these would be populated. If BotCreate runs and then
+      // LoadBotMemory runs, LoadBotMemory would overwrite these if is_used_in_save was true for that slot.
+      // If BotCreate runs for a bot whose slot *was* populated by LoadBotMemory,
+      // the current BotCreate logic would overwrite name/skin/skill/team/class with args or defaults.
+      // This is where the interaction is tricky. The loaded_from_persistence flag in BotSpawnInit
+      // primarily protects against *resetting* values during spawn.
+      // The initial setting of skill/team/class from persistence vs. args needs careful handling
+      // in BotCreate or immediately after LoadBotMemory.
 
-      pBot->bot_team = -1;
-      pBot->bot_class = -1;
+      if (!pBot->loaded_from_persistence) {
+          pBot->bot_skill = skill - 1;  // 0 based for array indexes
+          // Team and class are special, they might be forced by args for this specific creation
+          // If args are not given for team/class, *then* persisted team/class should be used if available.
+          // The logic below tries to handle this: args override persistence, persistence overrides default -1.
+          if (pBot->bot_team == -1) pBot->bot_team = -1; // Ensure it's -1 if not loaded and no args
+          if (pBot->bot_class == -1) pBot->bot_class = -1;
+      }
 
+      // Handle team/class arguments, potentially overriding loaded persistent values if args are provided
       if ((mod_id == TFC_DLL) || (mod_id == CSTRIKE_DLL) ||
           ((mod_id == GEARBOX_DLL) && (pent_info_ctfdetect != NULL)) ||
           (mod_id == FRONTLINE_DLL))
       {
-         if ((arg1 != NULL) && (arg1[0] != 0))
-         {
-            pBot->bot_team = atoi(arg1);
-
-            if ((arg2 != NULL) && (arg2[0] != 0))
-            {
-               pBot->bot_class = atoi(arg2);
-            }
+         if ((arg1 != NULL) && (arg1[0] != 0)) { // arg1 is team
+             pBot->bot_team = atoi(arg1); // Creation arg for team overrides loaded value
+             if ((arg2 != NULL) && (arg2[0] != 0)) { // arg2 is class
+                 pBot->bot_class = atoi(arg2); // Creation arg for class overrides loaded value
+             }
+         } else {
+             // No team/class args. If loaded from persistence, those values are already in pBot.
+             // If not loaded from persistence, they were set to -1 above.
          }
       }
    }

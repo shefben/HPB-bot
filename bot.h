@@ -301,6 +301,7 @@ typedef struct
    bot_current_weapon_t current_weapon;  // one current weapon for each bot
    int m_rgAmmo[MAX_AMMO_SLOTS];  // total ammo amounts (1 array for each bot)
 
+   bool loaded_from_persistence; // True if this bot's persistent fields were populated by LoadBotMemory
 } bot_t;
 
 
