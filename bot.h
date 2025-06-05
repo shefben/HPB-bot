@@ -334,6 +334,12 @@ typedef struct
    std::vector<RL_Aiming_Experience_t> current_aiming_episode_data; // Stores (s,a,r,log_p) tuples for current episode
    int aiming_episode_step_count;                   // Number of steps taken in current aiming episode
    float f_next_rl_aim_action_time;                 // Time when the next RL aiming action can be taken
+   // Fields for storing s_t, a_t for reward calculation at t+1
+   float last_aim_state_features[RL_AIMING_STATE_SIZE];
+   RL_AimingAction_e last_aim_action_taken;
+   float last_log_prob_action_taken;
+   bool has_last_aim_state_and_action;
+   bool last_shot_fired_was_by_rl;
 } bot_t;
 
 

@@ -1491,3 +1491,7 @@ void BotGrenadeThrow( bot_t *pBot )
          FakeClientCommand(pEdict, "-gren2", NULL, NULL);
    }
 }
+
+[end of bot_combat.cpp]
+
+[end of bot_combat.cpp]

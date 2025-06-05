@@ -106,6 +106,8 @@ const float AIM_RL_ADJUST_PITCH_SMALL_DEG = 0.3f;
 const float AIM_RL_ADJUST_PITCH_MEDIUM_DEG = 1.5f;
 const float AIM_RL_ADJUST_PITCH_LARGE_DEG = 3.0f;
 
+const float AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT = 0.1f; // Max absolute change for a single weight per update step
+
 #endif // BOT_RL_AIMING_CONSTANTS_H
 
 // --- Experience Struct for REINFORCE ---

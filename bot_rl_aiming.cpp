@@ -2,7 +2,7 @@
 
 #include "bot_rl_aiming.h"
 #include "bot.h" // For bot_t (will need members: aiming_rl_nn, aiming_nn_initialized, current_aiming_episode_data, aiming_episode_step_count)
-#include <cmath>      // For expf, logf
+#include <cmath>      // For expf, logf, fabsf
 #include <vector>     // For std::vector
 #include <numeric>    // For std::accumulate (optional)
 #include <algorithm>  // For std::max_element, std::fill (optional)
@@ -10,10 +10,15 @@
 #include <cstring>    // For memcpy
 
 // --- Global RL Parameters (can be CVars later) ---
-float AIM_RL_LEARNING_RATE = 0.001f;
-float AIM_RL_DISCOUNT_FACTOR = 0.99f;
-float AIM_RL_EXPLORATION_EPSILON = 0.1f; // For epsilon-greedy policy sampling
-const int MAX_AIMING_EPISODE_LENGTH = 100; // Max steps in an episode before forcing update
+// These are now effectively defaults if CVars are not yet integrated into these functions,
+// or if CVars are defined in dll.cpp and passed as arguments.
+// The subtask implies learning_rate and discount_factor are passed as args to RL_UpdatePolicyNetwork_REINFORCE.
+// Exploration_epsilon is passed to RL_ChooseAction_Policy.
+// MAX_AIMING_EPISODE_LENGTH will be compared against cvar in BotShootAtEnemy.
+float AIM_RL_LEARNING_RATE_DEFAULT = 0.001f;
+float AIM_RL_DISCOUNT_FACTOR_DEFAULT = 0.99f;
+float AIM_RL_EXPLORATION_EPSILON_DEFAULT = 0.1f;
+// const int MAX_AIMING_EPISODE_LENGTH_DEFAULT = 100; // This is defined in bot_rl_aiming.h via cvar in practice
 
 // --- Activation Functions ---
 static float rl_nn_sigmoid(float x) {
@@ -41,7 +46,6 @@ static void rl_nn_softmax(const std::vector<float>& raw_outputs, std::vector<flo
             probabilities_out[i] /= sum_exp;
         }
     } else {
-        // Fallback to uniform distribution if sum_exp is 0 or inf (should be rare)
         for (size_t i = 0; i < raw_outputs.size(); ++i) {
             probabilities_out[i] = 1.0f / raw_outputs.size();
         }
@@ -104,11 +108,14 @@ void RL_NN_FlattenWeights_Aiming(const RL_Aiming_NN_t* nn, float* flat_array) {
 void RL_NN_FeedForward_Aiming(RL_Aiming_NN_t* nn, const float* inputs, std::vector<float>& action_probabilities_out) {
     if (!nn || !inputs) return;
     if (nn->num_input_neurons <= 0 || nn->num_hidden_neurons <= 0 || nn->num_output_neurons <= 0) {
-        action_probabilities_out.assign(nn->num_output_neurons, 1.0f / nn->num_output_neurons); // Uniform if NN not setup
+        if (nn->num_output_neurons > 0) {
+             action_probabilities_out.assign(nn->num_output_neurons, 1.0f / nn->num_output_neurons);
+        } else {
+            action_probabilities_out.clear();
+        }
         return;
     }
 
-    // Input to Hidden Layer
     for (int j = 0; j < nn->num_hidden_neurons; ++j) {
         float hidden_sum = 0.0f;
         for (int i = 0; i < nn->num_input_neurons; ++i) {
@@ -118,7 +125,6 @@ void RL_NN_FeedForward_Aiming(RL_Aiming_NN_t* nn, const float* inputs, std::vect
         nn->hidden_layer_output_activations[j] = rl_nn_sigmoid(hidden_sum);
     }
 
-    // Hidden to Output Layer (raw activations/logits)
     std::vector<float> raw_outputs(nn->num_output_neurons);
     for (int k = 0; k < nn->num_output_neurons; ++k) {
         raw_outputs[k] = 0.0f;
@@ -131,12 +137,10 @@ void RL_NN_FeedForward_Aiming(RL_Aiming_NN_t* nn, const float* inputs, std::vect
     rl_nn_softmax(raw_outputs, action_probabilities_out);
 }
 
-// --- REINFORCE Algorithm Components ---
-
 RL_AimingAction_e RL_ChooseAction_Policy(RL_Aiming_NN_t* nn, const float* state_features_array,
                                          float exploration_epsilon, float* out_log_prob_action_taken) {
     if (!nn || !state_features_array || !out_log_prob_action_taken) {
-        if(out_log_prob_action_taken) *out_log_prob_action_taken = logf(1e-9f); // Small log prob for safety
+        if(out_log_prob_action_taken) *out_log_prob_action_taken = logf(1e-9f);
         return AIM_RL_HOLD_STEADY;
     }
 
@@ -144,32 +148,27 @@ RL_AimingAction_e RL_ChooseAction_Policy(RL_Aiming_NN_t* nn, const float* state_
     RL_NN_FeedForward_Aiming(nn, state_features_array, action_probs);
 
     RL_AimingAction_e chosen_action;
+    if (action_probs.empty() || NUM_AIMING_RL_ACTIONS <= 0) { // Safety for empty action space or probs
+        *out_log_prob_action_taken = logf(1e-9f);
+        return AIM_RL_HOLD_STEADY;
+    }
+
     if (((float)rand() / RAND_MAX) < exploration_epsilon) {
         chosen_action = (RL_AimingAction_e)(rand() % NUM_AIMING_RL_ACTIONS);
     } else {
         float r = (float)rand() / RAND_MAX;
         float cumulative_prob = 0.0f;
-        chosen_action = AIM_RL_HOLD_STEADY; // Default
-        bool action_selected = false;
+        chosen_action = (RL_AimingAction_e)(NUM_AIMING_RL_ACTIONS - 1); // Default to last action if loop fails
         for (int i = 0; i < NUM_AIMING_RL_ACTIONS; ++i) {
-            if (action_probs.size() <= (size_t)i) break; // Should not happen if NN is correct
             cumulative_prob += action_probs[i];
             if (r <= cumulative_prob) {
                 chosen_action = (RL_AimingAction_e)i;
-                action_selected = true;
                 break;
             }
         }
-        if (!action_selected && !action_probs.empty()) { // Fallback if float precision issues
-             chosen_action = (RL_AimingAction_e)(action_probs.size() -1);
-        }
     }
 
-    if (action_probs.empty() || (size_t)chosen_action >= action_probs.size()) {
-        *out_log_prob_action_taken = logf(1.0f / NUM_AIMING_RL_ACTIONS + 1e-9f); // Uniform if error
-    } else {
-        *out_log_prob_action_taken = logf(action_probs[chosen_action] + 1e-9f);
-    }
+    *out_log_prob_action_taken = logf(action_probs[chosen_action] + 1e-9f);
 
     return chosen_action;
 }
@@ -177,75 +176,112 @@ RL_AimingAction_e RL_ChooseAction_Policy(RL_Aiming_NN_t* nn, const float* state_
 void RL_StoreExperience_Policy(bot_t* pBot, const float* state_features,
                                RL_AimingAction_e action, float reward, float log_prob_action) {
     if (!pBot) return;
-    // Assuming pBot->current_aiming_episode_data is std::vector<RL_Aiming_Experience_t>
-    // This check should ideally use pBot->aiming_episode_step_count if that's the primary counter
-    if (pBot->current_aiming_episode_data.size() >= MAX_AIMING_EPISODE_LENGTH) {
-        // Episode is full, an update should have been triggered.
-        // Avoid adding more if it's already at max length waiting for update.
-        // Or, if this is meant to be a hard cap on buffer size:
-        // ALERT(at_console, "Warning: Aiming episode data full for bot %s. Not adding new experience.\n", pBot->name);
-        return;
-    }
+    // MAX_AIMING_EPISODE_LENGTH is now a CVar, accessed via bot_rl_aim_episode_max_steps.value in BotShootAtEnemy
+    // Here, we use a simpler check for vector capacity or rely on external logic to call update.
+    // For this function, let's just add. The calling logic in BotShootAtEnemy handles episode length.
     RL_Aiming_Experience_t exp;
     memcpy(exp.state_features, state_features, sizeof(float) * RL_AIMING_STATE_SIZE);
     exp.action_taken = action;
     exp.reward_received = reward;
     exp.log_prob_action = log_prob_action;
     pBot->current_aiming_episode_data.push_back(exp);
-    // pBot->aiming_episode_step_count++; // This should be incremented where action is taken
 }
 
 void RL_UpdatePolicyNetwork_REINFORCE(bot_t* pBot, float learning_rate, float discount_factor) {
-    if (!pBot || pBot->current_aiming_episode_data.empty() || !pBot->aiming_nn_initialized) return;
-
-    std::vector<float> discounted_returns(pBot->current_aiming_episode_data.size());
-    float current_return = 0.0f;
-
-    for (int t = pBot->current_aiming_episode_data.size() - 1; t >= 0; --t) {
-        current_return = pBot->current_aiming_episode_data[t].reward_received + discount_factor * current_return;
-        discounted_returns[t] = current_return;
+    if (!pBot || pBot->current_aiming_episode_data.empty() || !pBot->aiming_nn_initialized) {
+        if (pBot) {
+            pBot->current_aiming_episode_data.clear();
+            pBot->aiming_episode_step_count = 0;
+        }
+        return;
     }
 
-    // (Optional) Normalize discounted returns (subtract mean, divide by std_dev)
-    // float sum_returns = 0.0f;
-    // for(float ret : discounted_returns) sum_returns += ret;
-    // float mean_return = sum_returns / discounted_returns.size();
-    // float sq_sum_diff = 0.0f;
-    // for(float ret : discounted_returns) sq_sum_diff += (ret - mean_return) * (ret - mean_return);
-    // float std_dev_return = sqrtf(sq_sum_diff / discounted_returns.size());
-    // for (size_t t = 0; t < discounted_returns.size(); ++t) {
-    //     discounted_returns[t] = (discounted_returns[t] - mean_return) / (std_dev_return + 1e-9f);
-    // }
+    std::vector<RL_Aiming_Experience_t>& episode_data = pBot->current_aiming_episode_data;
+    int episode_length = episode_data.size();
+    RL_Aiming_NN_t* nn = &pBot->aiming_rl_nn;
 
-    // --- Placeholder for Gradient Update ---
-    // The actual REINFORCE update rule is:
-    // For each parameter theta_i in the network:
-    //   theta_i = theta_i + learning_rate * sum_over_episode( G_t * grad_log_pi(a_t | s_t, theta_i) )
-    // where grad_log_pi is the gradient of the log probability of the action taken w.r.t. theta_i.
-    // This requires backpropagation to calculate these gradients for each weight/bias.
-    //
-    // For example, for a weight w_jk from hidden neuron j to output neuron k (for action a_t):
-    // grad_log_pi = ( (a_t == k) - prob(action k) ) * activation_hidden_j
-    // (This is for softmax output and one action selected)
-    //
-    // This simplified implementation does not perform the actual weight updates.
-    // It only calculates G_t and clears the episode data.
-    // A full implementation would require a backpropagation pass or numerical gradients here.
-    // ------------------------------------
+    std::vector<float> discounted_returns(episode_length);
+    float current_G = 0.0f;
+    for (int t = episode_length - 1; t >= 0; --t) {
+        current_G = episode_data[t].reward_received + discount_factor * current_G;
+        discounted_returns[t] = current_G;
+    }
 
-    // ALERT(at_console, "Bot %s: RL_UpdatePolicyNetwork_REINFORCE called. %zu experiences. First G_t: %.2f\n",
-    //       pBot->name, pBot->current_aiming_episode_data.size(),
-    //       !discounted_returns.empty() ? discounted_returns[0] : 0.0f);
+    // Optional Normalization of discounted_returns - can be added later if needed for stability
+
+    for (int t = 0; t < episode_length; ++t) {
+        const RL_Aiming_Experience_t& exp_t = episode_data[t];
+        const float* s_t = exp_t.state_features;
+        RL_AimingAction_e a_t = exp_t.action_taken;
+        float G_t = discounted_returns[t];
+
+        std::vector<float> current_action_probabilities(nn->num_output_neurons);
+        RL_NN_FeedForward_Aiming(nn, s_t, current_action_probabilities);
+
+        std::vector<float> delta_output_scaled(nn->num_output_neurons);
+        for (int k = 0; k < nn->num_output_neurons; ++k) {
+            float pi_k = current_action_probabilities[k];
+            float target_gradient_component = ((k == (int)a_t) ? 1.0f : 0.0f) - pi_k;
+            delta_output_scaled[k] = target_gradient_component * G_t;
+        }
+
+        for (int j = 0; j < nn->num_hidden_neurons; ++j) {
+            float h_j = nn->hidden_layer_output_activations[j];
+            for (int k = 0; k < nn->num_output_neurons; ++k) {
+                float gradient_w_ho_jk = delta_output_scaled[k] * h_j;
+                float weight_update = learning_rate * gradient_w_ho_jk;
+                if (fabsf(weight_update) > AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT) {
+                    weight_update = (weight_update > 0 ? 1.0f : -1.0f) * AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT;
+                }
+                nn->weights_hidden_output[j * nn->num_output_neurons + k] += weight_update;
+            }
+        }
+        for (int k = 0; k < nn->num_output_neurons; ++k) {
+            float gradient_b_o_k = delta_output_scaled[k];
+            float bias_update = learning_rate * gradient_b_o_k;
+            if (fabsf(bias_update) > AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT) {
+                bias_update = (bias_update > 0 ? 1.0f : -1.0f) * AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT;
+            }
+            nn->bias_output[k] += bias_update;
+        }
+
+        std::vector<float> delta_hidden(nn->num_hidden_neurons);
+        for (int j = 0; j < nn->num_hidden_neurons; ++j) {
+            float error_sum_for_hidden_j = 0.0f;
+            for (int k = 0; k < nn->num_output_neurons; ++k) {
+                error_sum_for_hidden_j += delta_output_scaled[k] * nn->weights_hidden_output[j * nn->num_output_neurons + k];
+            }
+            float h_j = nn->hidden_layer_output_activations[j];
+            delta_hidden[j] = error_sum_for_hidden_j * h_j * (1.0f - h_j);
+        }
+
+        for (int i_input = 0; i_input < nn->num_input_neurons; ++i_input) {
+            float s_i = s_t[i_input];
+            for (int j = 0; j < nn->num_hidden_neurons; ++j) {
+                float gradient_w_ih_ij = delta_hidden[j] * s_i;
+                float weight_update = learning_rate * gradient_w_ih_ij;
+                if (fabsf(weight_update) > AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT) {
+                    weight_update = (weight_update > 0 ? 1.0f : -1.0f) * AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT;
+                }
+                nn->weights_input_hidden[i_input * nn->num_hidden_neurons + j] += weight_update;
+            }
+        }
+        for (int j = 0; j < nn->num_hidden_neurons; ++j) {
+            float gradient_b_h_j = delta_hidden[j];
+            float bias_update = learning_rate * gradient_b_h_j;
+            if (fabsf(bias_update) > AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT) {
+                bias_update = (bias_update > 0 ? 1.0f : -1.0f) * AIM_RL_MAX_GRADIENT_UPDATE_PER_WEIGHT;
+            }
+            nn->bias_hidden[j] += bias_update;
+        }
+    }
 
     pBot->current_aiming_episode_data.clear();
     pBot->aiming_episode_step_count = 0;
 }
 
 // --- RL Aiming Helper Functions ---
-
-// Externs often needed for these game interaction functions
-extern globalvars_t  *gpGlobals; // Already declared at top, but good to remember
-// extern edict_t *world; // Not explicitly used in provided snippet, but often needed for traces if not using pEdict->v.world
+extern globalvars_t  *gpGlobals;
 
 void PrepareRLAimingState(bot_t *pBot, edict_t *pEnemy, float* state_features_array) {
     if (!pBot || !pEnemy || !state_features_array || !pBot->pEdict || FNullEnt(pEnemy)) {
@@ -259,43 +295,38 @@ void PrepareRLAimingState(bot_t *pBot, edict_t *pEnemy, float* state_features_ar
     Vector current_angles = pEdict->v.v_angle;
     Vector target_angles = UTIL_VecToAngles(vec_to_enemy);
 
-    // Normalize target_angles.y to be within +/- 180 of current_angles.y for sensible delta
-    target_angles.y = UTIL_AngleMod(target_angles.y); // Ensure it's -180 to 180 first
-    // No, BotFixIdealYaw is better as it ensures the shortest path for yaw delta.
-    // The UTIL_AngleMod(target - current) handles shortest path.
+    target_angles.y = UTIL_AngleMod(target_angles.y);
 
     state_features_array[0] = UTIL_AngleMod(target_angles.y - current_angles.y) / 180.0f;
     state_features_array[1] = UTIL_AngleMod(target_angles.x - current_angles.x) / 90.0f;
     state_features_array[2] = vec_to_enemy.Length() / 3000.0f;
 
     float max_server_speed = CVAR_GET_FLOAT("sv_maxspeed");
-    if (max_server_speed <= 0) max_server_speed = 320.0f; // Default fallback
+    if (max_server_speed <= 0) max_server_speed = 320.0f;
 
     state_features_array[3] = pEnemy->v.velocity.x / max_server_speed;
     state_features_array[4] = pEnemy->v.velocity.y / max_server_speed;
-    // Consider if Z velocity for target is useful, or if X/Y on bot's view plane is better.
-    // For now, using world X/Y.
 
     state_features_array[5] = pEdict->v.velocity.Length() / max_server_speed;
     state_features_array[6] = pEnemy->v.velocity.Length() / max_server_speed;
 
-    state_features_array[7] = 0.0f; // Placeholder for pBot->current_weapon_spread
+    state_features_array[7] = 0.0f;
 
     float fire_rate = BotGetWeaponFireRate(&pBot->current_weapon);
-    if (fire_rate <= 0.0f) fire_rate = 0.1f; // Avoid div by zero, ensure it's a small non-zero time
+    if (fire_rate <= 0.0f) fire_rate = 0.1f;
     state_features_array[8] = (pBot->pEdict->v.nextattack > gpGlobals->time) ? (pBot->pEdict->v.nextattack - gpGlobals->time) / fire_rate : 0.0f;
 
     TraceResult tr;
     UTIL_TraceLine(vec_bot_eyes, pEnemy->v.origin + pEnemy->v.view_ofs, ignore_monsters, pEdict, &tr);
     state_features_array[9] = (tr.flFraction >= 1.0f || tr.pHit == pEnemy) ? 1.0f : 0.0f;
 
-    UTIL_TraceLine(vec_bot_eyes, pEnemy->v.origin + Vector(0,0,VEC_HULL_MAX_SCALED(pEnemy).z), ignore_monsters, pEdict, &tr); // Approx head
+    UTIL_TraceLine(vec_bot_eyes, pEnemy->v.origin + Vector(0,0,VEC_HULL_MAX_SCALED(pEnemy).z), ignore_monsters, pEdict, &tr);
     state_features_array[10] = (tr.flFraction >= 1.0f || tr.pHit == pEnemy) ? 1.0f : 0.0f;
 
     for(int i=0; i<RL_AIMING_STATE_SIZE; ++i) {
        if (state_features_array[i] > 1.0f) state_features_array[i] = 1.0f;
        else if (state_features_array[i] < -1.0f) state_features_array[i] = -1.0f;
-       else if (isnan(state_features_array[i])) state_features_array[i] = 0.0f; // Handle NaN
+       else if (isnan(state_features_array[i])) state_features_array[i] = 0.0f;
     }
 }
 
@@ -327,10 +358,6 @@ void ExecuteRLAimingAction(bot_t *pBot, RL_AimingAction_e action) {
         case AIM_RL_HOLD_STEADY:
         default: break;
     }
-    // Directly modify v_angle. The BotThink smoothing might fight this.
-    // For RL, we often want direct control for the chosen action's duration.
-    // Alternatively, these modify ideal_angles and BotFocusController moves towards them.
-    // For this iteration, let's modify v_angles directly.
     pEdict->v.v_angle.y = UTIL_AngleMod(pEdict->v.v_angle.y + yaw_change);
     pEdict->v.v_angle.x = UTIL_AngleMod(pEdict->v.v_angle.x + pitch_change);
 
@@ -345,11 +372,10 @@ float CalculateRLAimingReward(bot_t *pBot, edict_t *pEnemy, RL_AimingAction_e la
 
     *out_hit_target_this_step = false;
     float reward = 0.0f;
-    const float TIME_PENALTY = -0.01f; // Smaller time penalty
-    // const float AIM_CLOSER_REWARD = 0.5f; // This might be complex to compare prev state here
+    const float TIME_PENALTY = -0.01f;
     const float ON_TARGET_REWARD = 0.05f;
-    const float HIT_REWARD = 10.0f; // Scaled down, can be tuned
-    const float MISS_PENALTY = -0.2f; // Scaled down
+    const float HIT_REWARD = 10.0f;
+    const float MISS_PENALTY = -0.2f;
     const float CLEAR_LOS_REWARD = 0.02f;
 
     reward += TIME_PENALTY;
@@ -361,7 +387,7 @@ float CalculateRLAimingReward(bot_t *pBot, edict_t *pEnemy, RL_AimingAction_e la
         reward += ON_TARGET_REWARD;
     }
 
-    if (current_state_features[9] > 0.5f || current_state_features[10] > 0.5f) { // If LoS to center or head
+    if (current_state_features[9] > 0.5f || current_state_features[10] > 0.5f) {
         reward += CLEAR_LOS_REWARD;
     }
 
@@ -375,8 +401,6 @@ float CalculateRLAimingReward(bot_t *pBot, edict_t *pEnemy, RL_AimingAction_e la
         if (tr.pHit == pEnemy) {
             reward += HIT_REWARD;
             *out_hit_target_this_step = true;
-            // If damage dealt could be known here, it would be a better reward signal.
-            // This requires checking pEnemy->v.health before/after or using a damage event.
         } else {
             reward += MISS_PENALTY;
         }
