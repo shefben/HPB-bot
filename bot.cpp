@@ -19,15 +19,23 @@
 #include "bot_func.h"
 #include "waypoint.h"
 #include "bot_weapons.h"
+#include "bot_objective_discovery.h"
+#include "bot_tactical_ai.h"
+#include "bot_neuro_evolution.h"
+#include "bot_rl_aiming.h"         // For RL Aiming agent
+#include "bot_ngram_functions.h"   // For N-gram chat generation
+#include "bot_categorized_chat.h"  // For AdvancedChat_HandleGameEvent (though not directly used in this diff, good for context)
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <string.h>
+#include <cmath>
 
 
 extern edict_t *clients[32];
 extern int mod_id;
 extern WAYPOINT waypoints[MAX_WAYPOINTS];
-extern int num_waypoints;  // number of waypoints currently in use
+extern int num_waypoints;
 extern int default_bot_skill;
 extern int bot_strafe_percent;
 extern int bot_chat_percent;
@@ -43,6 +51,8 @@ extern edict_t *pent_info_ctfdetect;
 extern int bot_reaction_time;
 extern int IsDedicatedServer;
 extern int holywars_gamemode;
+extern edict_t *listenserver_edict;
+
 
 extern int max_team_players[4];
 extern int team_class_limits[4];
@@ -59,6 +69,21 @@ extern bool is_team_play;
 
 extern int number_skins;
 extern skin_t bot_skins[MAX_SKINS];
+
+extern GlobalTacticalState_t g_tactical_state;
+
+// CVars for chat system (defined in dll.cpp)
+extern cvar_t bot_advanced_chat_enable;
+extern cvar_t bot_ngram_chat_enable;
+extern cvar_t bot_ngram_chat_idle_frequency;
+
+// N-gram model (defined in bot_advanced_chat.cpp or bot_nlp_chat.cpp)
+extern NgramModel_t g_chat_ngram_model;
+
+// Constants for N-gram idle chat in BotThink
+const float NGRAM_BOTTHINK_MIN_INTERVAL = 10.0f;
+const float NGRAM_BOTTHINK_MAX_INTERVAL = 25.0f;
+const int NGRAM_BOTTHINK_MAX_LEN = 100;
 
 
 static FILE *fp;
@@ -77,14 +102,12 @@ char bot_names[MAX_BOT_NAMES][BOT_NAME_LEN+1];
 int num_logos = 0;
 char bot_logos[MAX_BOT_LOGOS][16];
 
-bot_t bots[32];   // max of 32 bots in a game
+bot_t bots[32];
 bool b_observer_mode = FALSE;
 bool b_botdontshoot = FALSE;
 
 
-// how often (out of 1000 times) the bot will pause, based on bot skill
 float pause_frequency[5] = {4, 7, 10, 15, 20};
-
 float pause_time[5][2] = {
    {0.2, 0.5}, {0.5, 1.0}, {0.7, 1.3}, {1.0, 1.7}, {1.2, 2.0}};
 
@@ -111,26 +134,23 @@ void BotSpawnInit( bot_t *pBot )
    pBot->waypoint_flag_origin = Vector(0, 0, 0);
    pBot->prev_waypoint_distance = 0.0;
 
-   pBot->weapon_points[0] = 0;
-   pBot->weapon_points[1] = 0;
-   pBot->weapon_points[2] = 0;
-   pBot->weapon_points[3] = 0;
-   pBot->weapon_points[4] = 0;
-   pBot->weapon_points[5] = 0;
+   if (!pBot->loaded_from_persistence) {
+       pBot->weapon_points[0] = 0;
+       pBot->weapon_points[1] = 0;
+       pBot->weapon_points[2] = 0;
+       pBot->weapon_points[3] = 0;
+       pBot->weapon_points[4] = 0;
+       pBot->weapon_points[5] = 0;
+   }
 
    pBot->blinded_time = 0.0;
-
    pBot->f_max_speed = CVAR_GET_FLOAT("sv_maxspeed");
-
-   pBot->f_prev_speed = 0.0;  // fake "paused" since bot is NOT stuck
-
+   pBot->f_prev_speed = 0.0;
    pBot->f_find_item = 0.0;
-
    pBot->ladder_dir = LADDER_UNKNOWN;
    pBot->f_start_use_ladder_time = 0.0;
    pBot->f_end_use_ladder_time = 0.0;
    pBot->waypoint_top_of_ladder = FALSE;
-
    pBot->f_wall_check_time = 0.0;
    pBot->f_wall_on_right = 0.0;
    pBot->f_wall_on_left = 0.0;
@@ -139,21 +159,16 @@ void BotSpawnInit( bot_t *pBot )
    pBot->f_jump_time = 0.0;
    pBot->f_drop_check_time = 0.0;
 
-   // pick a wander direction (50% of the time to the left, 50% to the right)
-   if (RANDOM_LONG(1, 100) <= 50)
-      pBot->wander_dir = WANDER_LEFT;
-   else
-      pBot->wander_dir = WANDER_RIGHT;
+   if (RANDOM_LONG(1, 100) <= 50) pBot->wander_dir = WANDER_LEFT;
+   else pBot->wander_dir = WANDER_RIGHT;
 
    pBot->f_exit_water_time = 0.0;
-
    pBot->pBotEnemy = NULL;
    pBot->f_bot_see_enemy_time = gpGlobals->time;
    pBot->f_bot_find_enemy_time = gpGlobals->time;
    pBot->f_aim_tracking_time = 0.0;
    pBot->f_aim_x_angle_delta = 0.0;
    pBot->f_aim_y_angle_delta = 0.0;
-
    pBot->pBotUser = NULL;
    pBot->f_bot_use_time = 0.0;
    pBot->b_bot_say = FALSE;
@@ -162,9 +177,7 @@ void BotSpawnInit( bot_t *pBot )
    pBot->f_bot_chat_time = gpGlobals->time;
    pBot->enemy_attack_count = 0;
    pBot->f_duck_time = 0.0;
-
    pBot->f_sniper_aim_time = 0.0;
-
    pBot->f_shoot_time = gpGlobals->time;
    pBot->f_primary_charging = -1.0;
    pBot->f_secondary_charging = -1.0;
@@ -175,46 +188,230 @@ void BotSpawnInit( bot_t *pBot )
    pBot->grenade_type = 0;
    pBot->f_grenade_search_time = 0.0;
    pBot->f_grenade_found_time = 0.0;
-
    pBot->f_medic_check_time = 0.0;
    pBot->f_medic_pause_time = 0.0;
    pBot->f_medic_yell_time = 0.0;
-
    pBot->f_pause_time = 0.0;
    pBot->f_sound_update_time = 0.0;
    pBot->bot_has_flag = FALSE;
-
    pBot->b_see_tripmine = FALSE;
    pBot->b_shoot_tripmine = FALSE;
    pBot->v_tripmine = Vector(0,0,0);
-
    pBot->b_use_health_station = FALSE;
    pBot->f_use_health_time = 0.0;
    pBot->b_use_HEV_station = FALSE;
    pBot->f_use_HEV_time = 0.0;
-
    pBot->b_use_button = FALSE;
    pBot->f_use_button_time = 0;
    pBot->b_lift_moving = FALSE;
-
    pBot->b_use_capture = FALSE;
    pBot->f_use_capture_time = 0.0;
    pBot->pCaptureEdict = NULL;
-
    pBot->b_spray_logo = FALSE;
-
    pBot->f_engineer_build_time = 0.0;
    pBot->b_build_sentrygun = FALSE;
    pBot->b_build_dispenser = FALSE;
    pBot->f_other_sentry_time = 0.0;
    pBot->b_upgrade_sentry = FALSE;
-
    pBot->f_medic_check_health_time = 0.0;
-
    pBot->f_reaction_target_time = 0.0;
 
    memset(&(pBot->current_weapon), 0, sizeof(pBot->current_weapon));
    memset(&(pBot->m_rgAmmo), 0, sizeof(pBot->m_rgAmmo));
+
+   pBot->current_discovered_objective_id = -1;
+   pBot->current_objective_desirability = 0.0f;
+   pBot->last_objective_selection_time = 0.0f;
+   pBot->is_interacting_with_objective = false;
+   pBot->interaction_timer = 0.0f;
+
+   pBot->f_next_tactical_nn_eval_time = gpGlobals->time + (TACTICAL_NN_EVAL_INTERVAL / 2.0f) + RANDOM_FLOAT(0, TACTICAL_NN_EVAL_INTERVAL / 2.0f);
+
+   // Reset fitness stats for the new spawn/evaluation period
+   pBot->current_eval_score_contribution = 0.0f;
+   pBot->current_eval_objectives_captured_or_defended = 0;
+   pBot->current_eval_kills = 0;
+   pBot->current_eval_deaths = 0;
+   pBot->current_eval_damage_dealt = 0.0f;
+   pBot->current_eval_survival_start_time = gpGlobals->time;
+   pBot->last_chosen_directive_for_fitness_eval = NUM_TACTICAL_DIRECTIVES; // A default/invalid state
+
+   // RL Aiming specific initializations
+   pBot->current_aiming_episode_data.clear();
+   pBot->aiming_episode_step_count = 0;
+   pBot->f_next_rl_aim_action_time = gpGlobals->time;
+   pBot->has_last_aim_state_and_action = false;
+   pBot->last_shot_fired_was_by_rl = false;
+}
+
+
+void PrepareNNInputs(bot_t *pBot, float* nn_input_array) {
+    if (!pBot || !nn_input_array || !gpGlobals) {
+        if (nn_input_array) memset(nn_input_array, 0, sizeof(float) * NN_INPUT_SIZE);
+        return;
+    }
+    memset(nn_input_array, 0, sizeof(float) * NN_INPUT_SIZE);
+
+    int current_idx = 0;
+    const GlobalTacticalState_t& ts = GetGlobalTacticalState();
+
+    nn_input_array[current_idx++] = (float)ts.current_game_phase / (float)(GAME_PHASE_GAME_OVER + 1);
+    float max_round_time_estimate = 180.0f;
+    if (ts.round_time_remaining > 0.001f && ts.round_time_elapsed >= 0) {
+        max_round_time_estimate = ts.round_time_elapsed + ts.round_time_remaining;
+        if (max_round_time_estimate <= 0.001f) max_round_time_estimate = 180.0f;
+        nn_input_array[current_idx++] = ts.round_time_remaining / max_round_time_estimate;
+    } else if (ts.round_time_elapsed >= 0) {
+         float normalized_elapsed = ts.round_time_elapsed / max_round_time_estimate;
+         nn_input_array[current_idx++] = (1.0f - normalized_elapsed > 0.0f ? (1.0f - normalized_elapsed) : 0.0f);
+    } else {
+        nn_input_array[current_idx++] = 0.5f;
+    }
+
+    int my_team_idx = pBot->bot_team;
+    int enemy_team_idx = -1;
+    float typical_win_score = (mod_id == CSTRIKE_DLL) ? 16.0f : ( (mod_id == TFC_DLL) ? 100.0f : 50.0f );
+
+    if (my_team_idx >= 0 && my_team_idx < MAX_TEAMS) {
+        nn_input_array[current_idx++] = ts.team_scores[my_team_idx] > 0 ? ((float)ts.team_scores[my_team_idx] / typical_win_score) : 0.0f;
+        if (ts.num_active_teams >= 2) {
+            for(int t=0; t < MAX_TEAMS; ++t) {
+                if (t != my_team_idx && ts.team_info[t].is_active_team) {
+                    enemy_team_idx = t;
+                    break;
+                }
+            }
+        }
+    } else {
+        nn_input_array[current_idx++] = 0.0f;
+    }
+    nn_input_array[current_idx++] = (enemy_team_idx != -1 && enemy_team_idx < MAX_TEAMS) ? ((float)ts.team_scores[enemy_team_idx] / typical_win_score) : 0.0f;
+
+    const TeamTacticalInfo_t* team_ptrs[2] = {NULL, NULL};
+    if (my_team_idx != -1 && my_team_idx < MAX_TEAMS && ts.team_info[my_team_idx].is_active_team) {
+        team_ptrs[0] = &ts.team_info[my_team_idx];
+    }
+    if (enemy_team_idx != -1 && enemy_team_idx < MAX_TEAMS && ts.team_info[enemy_team_idx].is_active_team) {
+        team_ptrs[1] = &ts.team_info[enemy_team_idx];
+    }
+
+    for (int team_loop_idx = 0; team_loop_idx < 2; ++team_loop_idx) {
+        const TeamTacticalInfo_t* t_info = team_ptrs[team_loop_idx];
+        if (t_info) {
+            nn_input_array[current_idx++] = t_info->num_total_players > 0 ? (float)t_info->num_alive_players / (float)t_info->num_total_players : 0.0f;
+            for (int c = 0; c < MAX_CLASSES_PER_MOD; ++c) {
+                nn_input_array[current_idx++] = t_info->num_total_players > 0 ? (float)t_info->class_counts[c] / (float)t_info->num_total_players : 0.0f;
+            }
+            nn_input_array[current_idx++] = t_info->aggregate_health_ratio;
+            nn_input_array[current_idx++] = t_info->aggregate_armor_ratio;
+            float max_money_estimate = (mod_id == CSTRIKE_DLL) ? (16000.0f * 5.0f) : 1.0f;
+            nn_input_array[current_idx++] = (max_money_estimate > 0.001f) ? (float)t_info->team_resource_A / max_money_estimate : 0.0f;
+        } else {
+            nn_input_array[current_idx++] = 0.0f;
+            for (int c = 0; c < MAX_CLASSES_PER_MOD; ++c) nn_input_array[current_idx++] = 0.0f;
+            nn_input_array[current_idx++] = 0.0f;
+            nn_input_array[current_idx++] = 0.0f;
+            nn_input_array[current_idx++] = 0.0f;
+        }
+    }
+
+    float map_diagonal_approx = 4096.0f;
+    for (int obj_loop_idx = 0; obj_loop_idx < TOP_N_OBJECTIVES_FOR_NN_INPUT; ++obj_loop_idx) {
+        if (obj_loop_idx < ts.num_valid_objectives) {
+            const ObjectivePointStatus_t* obj_status = &ts.objective_points[obj_loop_idx];
+            nn_input_array[current_idx++] = (float)obj_status->type / (float)(OBJ_TYPE_DOOR_OBSTACLE + 1);
+            float owner_norm = 0.5f;
+            if (obj_status->owner_team != -1 && my_team_idx != -1) {
+                 if(obj_status->owner_team == my_team_idx) owner_norm = 0.0f;
+                 else if (obj_status->owner_team == enemy_team_idx) owner_norm = 1.0f;
+                 else if (enemy_team_idx == -1 && obj_status->owner_team != my_team_idx) owner_norm = 1.0f;
+            }
+            nn_input_array[current_idx++] = owner_norm;
+            nn_input_array[current_idx++] = obj_status->is_contested ? 1.0f : 0.0f;
+            Vector rel_pos = obj_status->position - pBot->pEdict->v.origin;
+            nn_input_array[current_idx++] = rel_pos.x / map_diagonal_approx;
+            nn_input_array[current_idx++] = rel_pos.y / map_diagonal_approx;
+            nn_input_array[current_idx++] = rel_pos.z / map_diagonal_approx;
+            nn_input_array[current_idx++] = rel_pos.Length() / map_diagonal_approx;
+            bool is_flag_type = (obj_status->type == OBJ_TYPE_FLAG || obj_status->type == OBJ_TYPE_FLAG_LIKE_PICKUP);
+            nn_input_array[current_idx++] = is_flag_type && obj_status->is_flag_at_home_base ? 1.0f : 0.0f;
+        } else {
+            for(int f=0; f < 8; ++f) nn_input_array[current_idx++] = 0.0f;
+        }
+    }
+
+    if (current_idx > NN_INPUT_SIZE) {
+       // ALERT(at_console, "CRITICAL: PrepareNNInputs overflow! Wrote %d, NN_INPUT_SIZE is %d\n", current_idx, NN_INPUT_SIZE);
+    }
+    while(current_idx < NN_INPUT_SIZE) {
+        nn_input_array[current_idx++] = 0.0f;
+    }
+}
+
+
+#define HIGH_CONFIDENCE_THRESHOLD 0.7f
+#define OBJECTIVE_SELECTION_COOLDOWN 10.0f
+#define INTERACTION_DURATION 1.5f
+
+void BotSelectAndPursueDiscoveredObjective(bot_t *pBot) {
+    if (!gpGlobals || g_candidate_objectives.empty()) {
+        pBot->current_discovered_objective_id = -1;
+        return;
+    }
+    if (pBot->is_interacting_with_objective) {
+        return;
+    }
+    if ((gpGlobals->time - pBot->last_objective_selection_time) < OBJECTIVE_SELECTION_COOLDOWN && pBot->current_discovered_objective_id != -1) {
+        CandidateObjective_t* currentObj = GetCandidateObjectiveById(pBot->current_discovered_objective_id);
+        if (currentObj && currentObj->confidence_score >= HIGH_CONFIDENCE_THRESHOLD * 0.9f) {
+             return;
+        }
+    }
+    CandidateObjective_t* best_candidate = NULL;
+    float max_desirability = -1.0f;
+    if (pBot->current_discovered_objective_id != -1 && (gpGlobals->time - pBot->last_objective_selection_time) > (OBJECTIVE_SELECTION_COOLDOWN * 3.0f) ) {
+    } else if (pBot->current_discovered_objective_id != -1) {
+        CandidateObjective_t* currentObj = GetCandidateObjectiveById(pBot->current_discovered_objective_id);
+        if(currentObj) max_desirability = pBot->current_objective_desirability * 0.8f;
+    }
+    for (size_t i = 0; i < g_candidate_objectives.size(); ++i) {
+        CandidateObjective_t* cand = &g_candidate_objectives[i];
+        if (cand->confidence_score < HIGH_CONFIDENCE_THRESHOLD) continue;
+        float desirability = cand->confidence_score;
+        if (cand->learned_objective_type == OBJ_TYPE_FLAG_LIKE_PICKUP || cand->learned_objective_type == OBJ_TYPE_FLAG) {
+            desirability *= 1.5f;
+        } else if (cand->learned_objective_type == OBJ_TYPE_CAPTURE_POINT) {
+            desirability *= 1.2f;
+            if (cand->current_owner_team == pBot->bot_team && cand->current_owner_team != -1) desirability *= 0.1f;
+        } else if (cand->learned_objective_type == OBJ_TYPE_PRESSABLE_BUTTON) {
+            desirability *= 0.8f;
+        }
+        float dist_to_cand_sq = (cand->location - pBot->pEdict->v.origin).LengthSquared();
+        if (dist_to_cand_sq < 1.0f) dist_to_cand_sq = 1.0f;
+        desirability = desirability * 10000.0f / (100.0f + dist_to_cand_sq);
+        if (desirability > max_desirability) {
+            max_desirability = desirability;
+            best_candidate = cand;
+        }
+    }
+    if (best_candidate) {
+        if (pBot->current_discovered_objective_id != best_candidate->unique_id) {
+            // ALERT(at_console, "Bot %s new objective: ID %d (type %s), Des: %.2f\n", pBot->name, best_candidate->unique_id, ObjectiveTypeToString(best_candidate->learned_objective_type), max_desirability);
+        }
+        pBot->current_discovered_objective_id = best_candidate->unique_id;
+        pBot->current_objective_desirability = max_desirability;
+        pBot->last_objective_selection_time = gpGlobals->time;
+        int waypoint_idx = WaypointFindNearest(best_candidate->location, pBot->pEdict, REACHABLE_RANGE * 2, pBot->bot_team);
+        if (waypoint_idx != -1 && (waypoints[waypoint_idx].flags & W_FL_DELETED) == 0) {
+            pBot->waypoint_goal = waypoint_idx;
+            pBot->waypoint_origin = waypoints[waypoint_idx].origin;
+        } else {
+            pBot->waypoint_goal = -1;
+            pBot->waypoint_origin = best_candidate->location;
+        }
+        pBot->f_waypoint_goal_time = gpGlobals->time + 60.0f;
+        pBot->is_interacting_with_objective = false;
+    }
 }
 
 
@@ -631,21 +828,50 @@ void BotCreate( edict_t *pPlayer, const char *arg1, const char *arg2,
       pBot->is_used = TRUE;
       pBot->respawn_state = RESPAWN_IDLE;
       pBot->f_create_time = gpGlobals->time;
-      pBot->name[0] = 0;  // name not set by server yet
-      pBot->bot_money = 0;
-      pBot->sentrygun_waypoint = -1;
-      pBot->dispenser_waypoint = -1;
+      // Name handling: c_name is used for CreateFakeClient.
+      // If loaded from persistence, pBot->name would have the loaded name.
+      // The engine then sets pEdict->v.netname. BotThink ensures pBot->name gets this if pBot->name[0]==0.
+      if (pBot->loaded_from_persistence && pBot->name[0] != '\0') {
+         // If a name was loaded, ensure c_name uses it for CreateFakeClient if that's desired,
+         // but c_name is already determined above based on args or BotPickName.
+         // The critical part is that pBot->name itself isn't overwritten by a default *if loaded*.
+      } else {
+         pBot->name[0] = 0; // Ensure it's clear if not loaded, so BotThink can populate it.
+      }
+
+      if (!pBot->loaded_from_persistence) {
+          pBot->bot_money = 0; // Example: money is not persistent per this design
+          pBot->sentrygun_waypoint = -1;
+          pBot->dispenser_waypoint = -1;
+      }
+      // sentrygun_level and dispenser_built are dynamic.
       pBot->sentrygun_level = 0;
       pBot->dispenser_built = 0;
 
-      strcpy(pBot->skin, c_skin);
+      // Skin handling
+      if (pBot->loaded_from_persistence && pBot->skin[0] != '\0') {
+          // If a skin was loaded, ensure c_skin uses it.
+          // c_skin is determined above by args or defaults. If args were given, they override.
+          // If no args, and persistence is on, c_skin should ideally be pBot->skin.
+          // For now, we assume c_skin is set correctly above, and pBot->skin will take that value
+          // UNLESS loaded_from_persistence is true, in which case pBot->skin is already loaded.
+          // strcpy(c_skin, pBot->skin); // This would force use of loaded skin.
+      } else {
+          // If not loaded from persistence, pBot->skin will take the value of c_skin.
+          strcpy(pBot->skin, c_skin);
+      }
 
-      pBot->top_color = top_color;
-      pBot->bottom_color = bottom_color;
+      // Top/Bottom color
+      if (!pBot->loaded_from_persistence) {
+          pBot->top_color = top_color;
+          pBot->bottom_color = bottom_color;
+      } // else, they are already set from loaded data by LoadBotMemory
 
       pBot->pEdict = BotEnt;
 
-      BotPickLogo(pBot);
+      if (!pBot->loaded_from_persistence) {
+          BotPickLogo(pBot); // Pick a new logo only if not loaded
+      } // else, pBot->logo_name is already set by LoadBotMemory
 
       pBot->not_started = 1;  // hasn't joined game yet
 
@@ -678,40 +904,83 @@ void BotCreate( edict_t *pPlayer, const char *arg1, const char *arg2,
       pBot->round_end = 0;
       pBot->defender = 0;
 
-      pBot->strafe_percent = bot_strafe_percent;
-      pBot->chat_percent = bot_chat_percent;
-      pBot->taunt_percent = bot_taunt_percent;
-      pBot->whine_percent = bot_whine_percent;
-      pBot->chat_tag_percent = bot_chat_tag_percent;
-      pBot->chat_drop_percent = bot_chat_drop_percent;
-      pBot->chat_swap_percent = bot_chat_swap_percent;
-      pBot->chat_lower_percent = bot_chat_lower_percent;
-      pBot->logo_percent = bot_logo_percent;
+      if (!pBot->loaded_from_persistence) {
+          pBot->strafe_percent = bot_strafe_percent;
+          pBot->chat_percent = bot_chat_percent;
+          pBot->taunt_percent = bot_taunt_percent;
+          pBot->whine_percent = bot_whine_percent;
+          pBot->chat_tag_percent = bot_chat_tag_percent;
+          pBot->chat_drop_percent = bot_chat_drop_percent;
+          pBot->chat_swap_percent = bot_chat_swap_percent;
+          pBot->chat_lower_percent = bot_chat_lower_percent;
+          pBot->logo_percent = bot_logo_percent;
+          pBot->reaction_time = bot_reaction_time; // Set from global default if not loaded
+      }
+      // These are dynamic, not persistent in the same way
       pBot->f_strafe_direction = 0.0;  // not strafing
       pBot->f_strafe_time = 0.0;
-      pBot->reaction_time = bot_reaction_time;
+
+      // NN Initialization:
+      // If LoadBotMemory already initialized it with saved weights, pBot->nn_initialized will be true.
+      // Otherwise, initialize with random weights.
+      if (!pBot->nn_initialized) {
+          NN_Initialize(&pBot->tactical_nn, NN_INPUT_SIZE, NN_HIDDEN_SIZE, NUM_TACTICAL_DIRECTIVES,
+                        true,  // initialize_with_random_weights = true
+                        NULL); // initial_weights_data = NULL
+          pBot->nn_initialized = true;
+      }
+      // f_next_tactical_nn_eval_time is set in BotSpawnInit, but set here too for first creation before first spawn
+      pBot->f_next_tactical_nn_eval_time = gpGlobals->time + TACTICAL_NN_EVAL_INTERVAL + RANDOM_FLOAT(0,1.5f);
+
+      // Initialize RL Aiming specific fields
+      pBot->aiming_nn_initialized = false; // Will be true if loaded from persistence or initialized below
+      pBot->current_aiming_episode_data.clear();
+      pBot->aiming_episode_step_count = 0;
+      pBot->f_next_rl_aim_action_time = gpGlobals->time;
+      pBot->has_last_aim_state_and_action = false;
+      pBot->last_shot_fired_was_by_rl = false;
+
+      if (!pBot->aiming_nn_initialized) { // If persistence didn't load it
+          RL_NN_Initialize_Aiming(&pBot->aiming_rl_nn, RL_AIMING_STATE_SIZE, RL_AIMING_HIDDEN_LAYER_SIZE, RL_AIMING_OUTPUT_SIZE, true, NULL);
+          pBot->aiming_nn_initialized = true;
+      }
 
       pBot->f_start_vote_time = gpGlobals->time + RANDOM_LONG(120, 600);
       pBot->vote_in_progress = FALSE;
       pBot->f_vote_time = 0.0;
 
-      pBot->bot_skill = skill - 1;  // 0 based for array indexes
+      // Skill, team, class are more complex. They are set by BotCreate args or defaults.
+      // If LoadBotMemory ran, these would be populated. If BotCreate runs and then
+      // LoadBotMemory runs, LoadBotMemory would overwrite these if is_used_in_save was true for that slot.
+      // If BotCreate runs for a bot whose slot *was* populated by LoadBotMemory,
+      // the current BotCreate logic would overwrite name/skin/skill/team/class with args or defaults.
+      // This is where the interaction is tricky. The loaded_from_persistence flag in BotSpawnInit
+      // primarily protects against *resetting* values during spawn.
+      // The initial setting of skill/team/class from persistence vs. args needs careful handling
+      // in BotCreate or immediately after LoadBotMemory.
 
-      pBot->bot_team = -1;
-      pBot->bot_class = -1;
+      if (!pBot->loaded_from_persistence) {
+          pBot->bot_skill = skill - 1;  // 0 based for array indexes
+          // Team and class are special, they might be forced by args for this specific creation
+          // If args are not given for team/class, *then* persisted team/class should be used if available.
+          // The logic below tries to handle this: args override persistence, persistence overrides default -1.
+          if (pBot->bot_team == -1) pBot->bot_team = -1; // Ensure it's -1 if not loaded and no args
+          if (pBot->bot_class == -1) pBot->bot_class = -1;
+      }
 
+      // Handle team/class arguments, potentially overriding loaded persistent values if args are provided
       if ((mod_id == TFC_DLL) || (mod_id == CSTRIKE_DLL) ||
           ((mod_id == GEARBOX_DLL) && (pent_info_ctfdetect != NULL)) ||
           (mod_id == FRONTLINE_DLL))
       {
-         if ((arg1 != NULL) && (arg1[0] != 0))
-         {
-            pBot->bot_team = atoi(arg1);
-
-            if ((arg2 != NULL) && (arg2[0] != 0))
-            {
-               pBot->bot_class = atoi(arg2);
-            }
+         if ((arg1 != NULL) && (arg1[0] != 0)) { // arg1 is team
+             pBot->bot_team = atoi(arg1); // Creation arg for team overrides loaded value
+             if ((arg2 != NULL) && (arg2[0] != 0)) { // arg2 is class
+                 pBot->bot_class = atoi(arg2); // Creation arg for class overrides loaded value
+             }
+         } else {
+             // No team/class args. If loaded from persistence, those values are already in pBot.
+             // If not loaded from persistence, they were set to -1 above.
          }
       }
    }
@@ -1516,16 +1785,55 @@ void BotThink( bot_t *pBot )
    else
       pBot->msecnum++;
 
-   if (pBot->msecval < 1)    // don't allow msec to be less than 1...
-      pBot->msecval = 1;
-
-   if (pBot->msecval > 100)  // ...or greater than 100
-      pBot->msecval = 100;
+   if (pBot->msecval < 1) pBot->msecval = 1;
+   if (pBot->msecval > 100) pBot->msecval = 100;
 
 // TheFatal - END
 
    pBot->f_frame_time = pBot->msecval / 1000;  // calculate frame time
 
+   // Tactical NN Evaluation
+   if (pBot->nn_initialized && gpGlobals->time >= pBot->f_next_tactical_nn_eval_time && IsAlive(pBot->pEdict) && !pBot->not_started) {
+       pBot->f_next_tactical_nn_eval_time = gpGlobals->time + TACTICAL_NN_EVAL_INTERVAL;
+
+       float nn_inputs[NN_INPUT_SIZE];
+       PrepareNNInputs(pBot, nn_inputs);
+
+       float nn_outputs[NUM_TACTICAL_DIRECTIVES];
+       NN_FeedForward(&pBot->tactical_nn, nn_inputs, nn_outputs);
+
+       TacticalDirective chosen_directive = NN_GetBestDirective(nn_outputs, NUM_TACTICAL_DIRECTIVES);
+       pBot->last_chosen_directive_for_fitness_eval = chosen_directive; // Store for fitness evaluation
+
+       if (pBot->pEdict && pBot->name[0] != '\0') { // Ensure pEdict and name are valid
+            char log_msg[128];
+            sprintf(log_msg, "Bot %s (T%d,C%d) TacNN: %s\n", pBot->name, pBot->bot_team, pBot->bot_class, TacticalDirectiveToString(chosen_directive));
+            if (IsDedicatedServer) SERVER_PRINT(log_msg);
+            else if (listenserver_edict) ClientPrint(listenserver_edict, HUD_PRINTCONSOLE, log_msg);
+       }
+
+
+       // Optional Basic Action Link:
+       // This provides a simple link from NN output to the bot's objective selection logic.
+       if (pBot->current_discovered_objective_id == -1 || (gpGlobals->time - pBot->last_objective_selection_time > OBJECTIVE_SELECTION_COOLDOWN / 2.0f) ) {
+           int target_obj_gts_idx = -1; // Index within g_tactical_state.objective_points
+
+           if (chosen_directive == TACTICS_ATTACK_OBJECTIVE_1 && GetGlobalTacticalState().num_valid_objectives > 0) target_obj_gts_idx = 0;
+           else if (chosen_directive == TACTICS_ATTACK_OBJECTIVE_2 && GetGlobalTacticalState().num_valid_objectives > 1) target_obj_gts_idx = 1;
+           else if (chosen_directive == TACTICS_ATTACK_OBJECTIVE_3 && GetGlobalTacticalState().num_valid_objectives > 2) target_obj_gts_idx = 2;
+           // TODO: Add similar logic for TACTICS_DEFEND_OBJECTIVE_X
+
+           if (target_obj_gts_idx != -1) {
+               const GlobalTacticalState_t& ts = GetGlobalTacticalState();
+               if (target_obj_gts_idx < ts.num_valid_objectives) { // Bounds check
+                    pBot->current_discovered_objective_id = ts.objective_points[target_obj_gts_idx].id;
+                    pBot->current_objective_desirability = 1.5f; // High desirability as NN chose it
+                    pBot->last_objective_selection_time = gpGlobals->time;
+                    pBot->is_interacting_with_objective = false; // Reset interaction state
+               }
+           }
+       }
+   }
    
    pEdict->v.button = 0;
    pBot->f_move_speed = 0.0;
@@ -1558,8 +1866,26 @@ void BotThink( bot_t *pBot )
 
          pBot->need_to_initialize = FALSE;
 
+         // Call advanced chat handler for being killed by an enemy
+         if (pBot->killer_edict != NULL && !FNullEnt(pBot->killer_edict) && bot_advanced_chat_enable.value > 0) {
+             // Check if the killer is not the bot itself (e.g. suicide, world)
+             if (pBot->killer_edict != pBot->pEdict) {
+                // Check if killer is not a teammate (if teamplay is on)
+                bool is_teamkill = false;
+                if (is_team_play && UTIL_GetTeam(pBot->killer_edict) == pBot->bot_team && pBot->killer_edict != pBot->pEdict) {
+                    is_teamkill = true;
+                }
+
+                if (is_teamkill) {
+                    AdvancedChat_HandleGameEvent(pBot, CHAT_EVENT_WAS_KILLED_BY_TEAMMATE, pBot->killer_edict, NULL, NULL);
+                } else {
+                    AdvancedChat_HandleGameEvent(pBot, CHAT_EVENT_WAS_KILLED_BY_ENEMY, pBot->killer_edict, NULL, NULL);
+                }
+             }
+         }
+
          // did another player kill this bot AND bot whine messages loaded AND
-         // has the bot been alive for at least 15 seconds AND
+         // has the bot been alive for at least 15 seconds AND (original HPB whine logic)
          if ((pBot->killer_edict != NULL) && (bot_whine_count > 0) &&
              ((pBot->f_bot_spawn_time + 15.0) <= gpGlobals->time))
          {
@@ -1679,6 +2005,31 @@ void BotThink( bot_t *pBot )
 
          BotChatFillInName(pBot->bot_say_msg, chat_text, chat_name, bot_name);
       }
+   }
+   // N-gram based idle chat addition
+   else if (IsAlive(pEdict) && // Only try to chat if alive
+            bot_advanced_chat_enable.value > 0 &&
+            bot_ngram_chat_enable.value > 0 &&
+            g_chat_ngram_model.n_value > 0 && !g_chat_ngram_model.model_data.empty() &&
+            RANDOM_LONG(1, 100) <= (int)bot_ngram_chat_idle_frequency.value) {
+
+       if (gpGlobals->time >= pBot->f_bot_chat_time) { // Respect general cooldown
+           std::string seed_phrase = "";
+           if (g_chat_ngram_model.n_value > 1 && RANDOM_LONG(0, 2) == 0) {
+               const char* common_starters[] = {"the", "i", "it", "enemy", "team", "this", "that"}; // Added more
+               seed_phrase = common_starters[RANDOM_LONG(0, (sizeof(common_starters)/sizeof(char*)) -1 )];
+           }
+
+           std::string ngram_sentence = AdvancedChat_GenerateNgramSentence(&g_chat_ngram_model, seed_phrase, 12);
+
+           if (!ngram_sentence.empty() && ngram_sentence.length() < NGRAM_BOTTHINK_MAX_LEN && ngram_sentence.length() > 3) {
+               // Use UTIL_HostSay directly, as b_bot_say and bot_say_msg are for the older system.
+               // Ensure UTIL_HostSay is safe to call with potentially formatted strings if any placeholders were used.
+               // For N-gram, usually raw text is fine.
+               UTIL_HostSay(pEdict, 0, (char*)ngram_sentence.c_str());
+               pBot->f_bot_chat_time = gpGlobals->time + RANDOM_FLOAT(NGRAM_BOTTHINK_MIN_INTERVAL, NGRAM_BOTTHINK_MAX_INTERVAL);
+           }
+       }
    }
 
 
@@ -1916,6 +2267,59 @@ void BotThink( bot_t *pBot )
       {
          // no enemy, let's just wander around...
 
+           // If interacting, handle that (this comes before selecting new objective)
+           if (pBot->is_interacting_with_objective) {
+               pBot->f_move_speed = 0; // Stand still while interacting
+               pBot->pEdict->v.button |= IN_USE; // Hold +use
+               if (gpGlobals->time >= pBot->interaction_timer) {
+                   pBot->is_interacting_with_objective = false; // Interaction done
+                   pBot->current_discovered_objective_id = -1; // Clear objective to allow re-evaluation
+                   pBot->current_objective_desirability = 0.0f;
+                   pBot->last_objective_selection_time = gpGlobals->time; // Allow new selection soon
+                   // ALERT(at_console, "Bot %s finished interaction attempt.\n", pBot->name);
+               }
+           }
+           // If not interacting, and not paused, then consider objectives or waypoints
+           else if (pBot->f_pause_time <= gpGlobals->time)
+           {
+               BotSelectAndPursueDiscoveredObjective(pBot); // THIS IS THE NEW CALL
+
+               // Existing waypoint logic will use pBot->waypoint_goal / pBot->waypoint_origin
+               found_waypoint = FALSE;
+               if ((pBot->pBotPickupItem == NULL) &&
+                   (pBot->f_look_for_waypoint_time <= gpGlobals->time) &&
+                   (num_waypoints != 0 || pBot->current_discovered_objective_id != -1))
+               {
+                   // Check if near current discovered objective's location
+                   if (pBot->current_discovered_objective_id != -1 && !pBot->is_interacting_with_objective) { // Don't re-check if already decided to interact this frame
+                       CandidateObjective_t* pObj = GetCandidateObjectiveById(pBot->current_discovered_objective_id);
+                       if (pObj) {
+                           float dist_sq_to_obj_loc = (pObj->location - pBot->pEdict->v.origin).LengthSquared();
+                           if (dist_sq_to_obj_loc < (64.0f * 64.0f)) { // Within 64 units
+                               if (pObj->learned_activation_method == ACT_TOUCH ||
+                                   pObj->learned_activation_method == ACT_USE ||
+                                   pObj->learned_activation_method == ACT_UNKNOWN) {
+
+                                   pBot->is_interacting_with_objective = true;
+                                   pBot->interaction_timer = gpGlobals->time + INTERACTION_DURATION;
+                                   pBot->f_move_speed = 0;
+                                   pBot->pEdict->v.button |= IN_USE;
+                                   // ALERT(at_console, "Bot %s starting interaction with obj ID %d\n", pBot->name, pObj->unique_id);
+                               } else {
+                                    pBot->current_discovered_objective_id = -1;
+                                    pBot->current_objective_desirability = 0.0f;
+                               }
+                               pBot->last_objective_selection_time = gpGlobals->time;
+                           }
+                       }
+                   }
+
+                   if (!pBot->is_interacting_with_objective) { // Only navigate if not currently interacting
+                        found_waypoint = BotHeadTowardWaypoint(pBot);
+                   } else {
+                        found_waypoint = true; // تعتبر متجهة نحو الهدف اثناء التفاعل
+                   }
+               }
             // took too long trying to spray logo?...
          if ((pBot->b_spray_logo) &&
              ((pBot->f_spray_logo_time + 3.0) < gpGlobals->time))
@@ -2709,3 +3113,4 @@ void BotThink( bot_t *pBot )
    return;
 }
 
+[end of bot.cpp]

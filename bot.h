@@ -9,6 +9,9 @@
 #ifndef BOT_H
 #define BOT_H
 
+#include "bot_neuro_evolution.h" // For TacticalNeuralNetwork_t
+#include "bot_rl_aiming.h"       // For RL Aiming structures
+
 // stuff for Win32 vs. Linux builds
 
 #ifndef _WIN32
@@ -301,6 +304,42 @@ typedef struct
    bot_current_weapon_t current_weapon;  // one current weapon for each bot
    int m_rgAmmo[MAX_AMMO_SLOTS];  // total ammo amounts (1 array for each bot)
 
+   bool loaded_from_persistence; // True if this bot's persistent fields were populated by LoadBotMemory
+
+   // Fields for discovered objective pursuit
+   int current_discovered_objective_id;     // unique_id of CandidateObjective_t bot is pursuing
+   float current_objective_desirability;    // Cached desirability of this objective
+   float last_objective_selection_time;   // gpGlobals->time when current objective was chosen
+   bool  is_interacting_with_objective;   // Flag: bot is at objective and trying to interact
+   float interaction_timer;               // Timer for interaction attempt
+
+   // NN related fields
+   TacticalNeuralNetwork_t tactical_nn;
+   bool nn_initialized;
+   float f_next_tactical_nn_eval_time;
+
+   // Fitness-related stats for current evaluation period
+   float fitness_score;                              // Final fitness from last generation
+   float current_eval_score_contribution;          // e.g., points from objectives, direct score actions
+   int   current_eval_objectives_captured_or_defended; // Count of objectives this bot helped secure
+   int   current_eval_kills;
+   int   current_eval_deaths;
+   float current_eval_damage_dealt;                  // Might be harder to track accurately without engine support
+   float current_eval_survival_start_time;           // Time evaluation period started or bot spawned
+   TacticalDirective last_chosen_directive_for_fitness_eval; // Directive active around key events
+
+   // --- Fields for Reinforcement Learning (Aiming) ---
+   RL_Aiming_NN_t aiming_rl_nn;                     // Neural network for aiming
+   bool aiming_nn_initialized;                      // Flag if aiming NN has been initialized
+   std::vector<RL_Aiming_Experience_t> current_aiming_episode_data; // Stores (s,a,r,log_p) tuples for current episode
+   int aiming_episode_step_count;                   // Number of steps taken in current aiming episode
+   float f_next_rl_aim_action_time;                 // Time when the next RL aiming action can be taken
+   // Fields for storing s_t, a_t for reward calculation at t+1
+   float last_aim_state_features[RL_AIMING_STATE_SIZE];
+   RL_AimingAction_e last_aim_action_taken;
+   float last_log_prob_action_taken;
+   bool has_last_aim_state_and_action;
+   bool last_shot_fired_was_by_rl;
 } bot_t;
 
 
