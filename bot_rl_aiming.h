@@ -135,10 +135,15 @@ void RL_UpdatePolicyNetwork_REINFORCE(bot_t* pBot, float learning_rate, float di
 // Helper function prototypes for RL Aiming logic
 void PrepareRLAimingState(bot_t *pBot, edict_t *pEnemy, float* state_features_array);
 void ExecuteRLAimingAction(bot_t *pBot, RL_AimingAction_e action);
-float CalculateRLAimingReward(bot_t *pBot, edict_t *pEnemy, RL_AimingAction_e last_action,
-                              const float* current_state_features, bool shot_fired_this_step,
-                              bool* out_hit_target_this_step);
+float CalculateRLAimingReward(
+    bot_t *pBot, edict_t *pEnemy,
+    RL_AimingAction_e action_taken_at_s_t,      // a_t
+    const float* state_features_s_t_plus_1,    // s_t+1 (current state after action)
+    const float* state_features_s_t,           // s_t (state before action)
+    bool shot_fired_by_rl_at_s_t,              // Was IN_ATTACK set by RL for a_t?
+    bool* out_hit_target_at_s_t                 // Did that shot hit?
+);
 
-const char* RL_AimingActionToString(RL_AimingAction_e action); // New prototype
+const char* RL_AimingActionToString(RL_AimingAction_e action);
 
 #endif // BOT_RL_AIMING_H

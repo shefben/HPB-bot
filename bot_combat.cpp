@@ -1081,16 +1081,21 @@ void BotShootAtEnemy( bot_t *pBot )
 
    edict_t *pEdict = pBot->pEdict;
 
+   // Initial safety checks
    if (!pEdict || FNullEnt(pEdict)) {
        return;
    }
+   // If no enemy, or enemy is not alive, nothing to shoot at.
+   // This check is vital before RL logic or original logic.
    if (!pBot->pBotEnemy || FNullEnt(pBot->pBotEnemy) || !IsAlive(pBot->pBotEnemy)) {
-       pBot->pBotEnemy = NULL;
+       pBot->pBotEnemy = NULL; // Clear enemy if invalid
        return;
    }
 
+   // --- Reinforcement Learning Aiming Logic ---
+   // Ensure bot itself is alive before attempting RL aiming
    if (pBot->aiming_nn_initialized && gpGlobals->time >= pBot->f_next_rl_aim_action_time && IsAlive(pEdict)) {
-       pBot->f_next_rl_aim_action_time = gpGlobals->time + 0.1f;
+       pBot->f_next_rl_aim_action_time = gpGlobals->time + 0.1f; // RL action interval (e.g., 100ms)
 
        float state_features[RL_AIMING_STATE_SIZE];
        PrepareRLAimingState(pBot, pBot->pBotEnemy, state_features);
@@ -1099,12 +1104,14 @@ void BotShootAtEnemy( bot_t *pBot )
        RL_AimingAction_e chosen_action = RL_ChooseAction_Policy(&pBot->aiming_rl_nn, state_features, AIM_RL_EXPLORATION_EPSILON, &log_prob_action);
 
        bool shot_attempted_this_step = (chosen_action == AIM_RL_FIRE_PRIMARY);
+       // Check if bot can actually fire (weapon cooldown)
        if (shot_attempted_this_step && pEdict->v.nextattack > gpGlobals->time) {
            shot_attempted_this_step = false;
        }
 
-       ExecuteRLAimingAction(pBot, chosen_action);
+       ExecuteRLAimingAction(pBot, chosen_action); // Modifies pEdict->v.v_angle and may set IN_ATTACK
 
+       // Calculate reward
        bool hit_this_step = false;
        float reward = CalculateRLAimingReward(pBot, pBot->pBotEnemy, chosen_action, state_features, shot_attempted_this_step, &hit_this_step);
 
@@ -1115,13 +1122,13 @@ void BotShootAtEnemy( bot_t *pBot )
        const float RL_HIT_KILL_REWARD_BONUS = 20.0f;
        const float RL_DEATH_PENALTY_BONUS = -15.0f;
 
-       if (hit_this_step && pBot->pBotEnemy && pBot->pBotEnemy->v.health <= 0) {
+       if (hit_this_step && pBot->pBotEnemy && pBot->pBotEnemy->v.health <= 0) { // Re-check pBotEnemy for safety
            if (!pBot->current_aiming_episode_data.empty()) {
                pBot->current_aiming_episode_data.back().reward_received += RL_HIT_KILL_REWARD_BONUS;
            }
            episode_done = true;
            pBot->pBotEnemy = NULL;
-       } else if (!pBot->pBotEnemy || !IsAlive(pBot->pBotEnemy) || (pBot->pBotEnemy->v.effects & EF_NODRAW)) {
+       } else if (!pBot->pBotEnemy || !IsAlive(pBot->pBotEnemy) || (pBot->pBotEnemy->v.effects & EF_NODRAW)) { // Check pBotEnemy again
            episode_done = true;
            pBot->pBotEnemy = NULL;
        } else if (!IsAlive(pEdict)) {
@@ -1136,9 +1143,13 @@ void BotShootAtEnemy( bot_t *pBot )
        if (episode_done) {
            RL_UpdatePolicyNetwork_REINFORCE(pBot, AIM_RL_LEARNING_RATE, AIM_RL_DISCOUNT_FACTOR);
        }
+       // The bot's v_angle and button state are set by ExecuteRLAimingAction.
+       // These will be used by pfnRunPlayerMove in BotThink.
        return;
    }
 
+   // --- Original Aiming Logic (Fallback if RL doesn't run or conditions not met) ---
+   // The original 'if (pBot->f_reaction_target_time > gpGlobals->time) return;' is part of the fallback.
    if (pBot->f_reaction_target_time > gpGlobals->time)
       return;
 
@@ -1491,7 +1502,3 @@ void BotGrenadeThrow( bot_t *pBot )
          FakeClientCommand(pEdict, "-gren2", NULL, NULL);
    }
 }
-
-[end of bot_combat.cpp]
-
-[end of bot_combat.cpp]

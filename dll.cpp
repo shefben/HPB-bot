@@ -23,6 +23,12 @@
 #include "bot_tactical_ai.h" // For TacticalAI functions
 #include "bot_objective_discovery.h" // For Objective Discovery functions
 #include "bot_neuro_evolution.h" // For NE_PerformEvolutionaryCycle and constants
+#include "bot_nlp_chat.h"      // For NLP chat functions and model access
+#include <vector>              // For std::vector (used in NLP command)
+#include <string>              // For std::string (used in NLP command)
+#include <cstdlib>             // For srand, atoi
+#include <ctime>               // For time (for srand)
+
 
 // Define BOT_MEMORY_FILENAME if not globally visible (it's not from bot_memory.cpp's perspective for dll.cpp)
 #ifndef BOT_MEMORY_FILENAME
@@ -114,6 +120,9 @@ cvar_t bot_rl_aim_exploration_epsilon = {"bot_rl_aim_exploration_epsilon", "0.1"
 cvar_t bot_rl_aim_episode_max_steps = {"bot_rl_aim_episode_max_steps", "100", FCVAR_SERVER};
 cvar_t bot_rl_aim_action_interval = {"bot_rl_aim_action_interval", "0.1", FCVAR_SERVER}; // Interval for RL actions
 
+// CVar for NLP Chat Model
+cvar_t bot_chat_use_nlp_model = {"bot_chat_use_nlp_model", "0", FCVAR_SERVER};
+
 edict_t *pent_info_tfdetect = NULL;
 edict_t *pent_info_ctfdetect = NULL;
 edict_t *pent_info_frontline = NULL;
@@ -202,6 +211,38 @@ void GameDLLInit( void )
    CVAR_REGISTER(&bot_rl_aim_exploration_epsilon);
    CVAR_REGISTER(&bot_rl_aim_episode_max_steps);
    CVAR_REGISTER(&bot_rl_aim_action_interval);
+
+   // Register NLP Chat CVar
+   CVAR_REGISTER(&bot_chat_use_nlp_model);
+
+   // Seed random number generator (globally for the DLL)
+   srand((unsigned int)time(NULL));
+
+   // Initialize NLP Chat Model
+   ALERT(at_console, "NLP_Chat: Initializing N-gram model...\n");
+   std::vector<std::string> chat_corpus;
+   NLP_LoadCorpusFromFile("HPB_bot_chat.txt", NULL, chat_corpus); // mod_name_for_path is unused
+
+   if (!chat_corpus.empty()) {
+       const int N_FOR_CHAT_MODEL = 3; // Use trigrams
+       NLP_TrainModel(chat_corpus, N_FOR_CHAT_MODEL, g_chat_ngram_model);
+       g_ngram_model_N_value = N_FOR_CHAT_MODEL;
+       if (g_chat_ngram_model.empty()) {
+           ALERT(at_console, "NLP_Chat: WARNING - N-gram model is empty after training! Check corpus and N value.\n");
+       }
+   } else {
+       ALERT(at_console, "NLP_Chat: WARNING - Chat corpus is empty. NLP Chat disabled.\n");
+   }
+
+   // Load Advanced Categorized Chat File
+   AdvancedChat_LoadChatFile("HPB_bot_adv_chat.txt");
+
+   // Load N-gram Chat Model Data
+   if (AdvancedChat_LoadNgramData("user/ngram_chat_model.txt")) { // Example filename
+       SERVER_PRINT("N-gram chat model loaded successfully.\n");
+   } else {
+       SERVER_PRINT("Warning: Failed to load N-gram chat model from user/ngram_chat_model.txt. N-gram chat may be disabled or ineffective.\n");
+   }
 
    RETURN_META (MRES_IGNORED);
 }
@@ -456,6 +497,58 @@ void ClientCommand( edict_t *pEntity )
               RL_UpdatePolicyNetwork_REINFORCE(pFoundBot, bot_rl_aim_learning_rate.value, bot_rl_aim_discount_factor.value);
               ClientPrint(pEntity, HUD_PRINTCONSOLE, "Forced RL Aim NN update for bot.\n");
           } else { ClientPrint(pEntity, HUD_PRINTCONSOLE, "Bot not found, NN not init, or no episode data to update from.\n"); }
+          RETURN_META(MRES_SUPERCEDE);
+      }
+      else if (FStrEq(pcmd, "bot_test_nlp_chat"))
+      {
+          if (pEntity != listenserver_edict && !IS_DEDICATED_SERVER()) {
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "Command only for listen server admin or server console.\n");
+              RETURN_META(MRES_SUPERCEDE);
+          }
+
+          if (g_chat_ngram_model.empty() || g_ngram_model_N_value <= 0) {
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, "NLP Chat Model not trained or N is invalid.\n");
+              RETURN_META(MRES_SUPERCEDE);
+          }
+
+          int num_to_generate = 5;
+          int n_val_to_use = g_ngram_model_N_value;
+          int max_words_to_use = 15;
+
+          const char* arg_num_gen_str = CMD_ARGV(1);
+          if (arg_num_gen_str && arg_num_gen_str[0] != '\0') {
+              num_to_generate = atoi(arg_num_gen_str);
+              if (num_to_generate <= 0 || num_to_generate > 50) num_to_generate = 5;
+          }
+
+          const char* arg_n_val_str = CMD_ARGV(2); // This argument is informational, generation uses g_ngram_model_N_value
+          if (arg_n_val_str && arg_n_val_str[0] != '\0') {
+             int temp_n = atoi(arg_n_val_str);
+             if (temp_n != g_ngram_model_N_value) {
+                 ClientPrint(pEntity, HUD_PRINTCONSOLE, "NLP Test: Command uses globally trained N-value (%d). Argument for N is ignored.\n", g_ngram_model_N_value);
+             }
+          }
+
+          const char* arg_max_words_str = CMD_ARGV(3);
+          if (arg_max_words_str && arg_max_words_str[0] != '\0') {
+              max_words_to_use = atoi(arg_max_words_str);
+              if (max_words_to_use <= 0 || max_words_to_use > 50) max_words_to_use = 15;
+          }
+
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- Generating Test NLP Chat Messages (N=%d, MaxWords=%d) ---\n", n_val_to_use, max_words_to_use);
+          char msg_buf[256];
+
+          for (int i = 0; i < num_to_generate; ++i) {
+              std::string generated_message = NLP_GenerateChatMessage(g_chat_ngram_model, n_val_to_use, max_words_to_use);
+              if (generated_message.empty()) {
+                  sprintf(msg_buf, "%d: <generation failed or empty>\n", i + 1);
+              } else {
+                  sprintf(msg_buf, "%d: %s\n", i + 1, generated_message.c_str());
+              }
+              ClientPrint(pEntity, HUD_PRINTCONSOLE, msg_buf);
+          }
+          ClientPrint(pEntity, HUD_PRINTCONSOLE, "--- End of Test NLP Chat Messages ---\n");
+
           RETURN_META(MRES_SUPERCEDE);
       }
    }

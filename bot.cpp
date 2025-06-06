@@ -23,6 +23,8 @@
 #include "bot_tactical_ai.h"
 #include "bot_neuro_evolution.h"
 #include "bot_rl_aiming.h"         // For RL Aiming agent
+#include "bot_ngram_functions.h"   // For N-gram chat generation
+#include "bot_categorized_chat.h"  // For AdvancedChat_HandleGameEvent (though not directly used in this diff, good for context)
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -69,6 +71,19 @@ extern int number_skins;
 extern skin_t bot_skins[MAX_SKINS];
 
 extern GlobalTacticalState_t g_tactical_state;
+
+// CVars for chat system (defined in dll.cpp)
+extern cvar_t bot_advanced_chat_enable;
+extern cvar_t bot_ngram_chat_enable;
+extern cvar_t bot_ngram_chat_idle_frequency;
+
+// N-gram model (defined in bot_advanced_chat.cpp or bot_nlp_chat.cpp)
+extern NgramModel_t g_chat_ngram_model;
+
+// Constants for N-gram idle chat in BotThink
+const float NGRAM_BOTTHINK_MIN_INTERVAL = 10.0f;
+const float NGRAM_BOTTHINK_MAX_INTERVAL = 25.0f;
+const int NGRAM_BOTTHINK_MAX_LEN = 100;
 
 
 static FILE *fp;
@@ -225,6 +240,8 @@ void BotSpawnInit( bot_t *pBot )
    pBot->current_aiming_episode_data.clear();
    pBot->aiming_episode_step_count = 0;
    pBot->f_next_rl_aim_action_time = gpGlobals->time;
+   pBot->has_last_aim_state_and_action = false;
+   pBot->last_shot_fired_was_by_rl = false;
 }
 
 
@@ -920,6 +937,8 @@ void BotCreate( edict_t *pPlayer, const char *arg1, const char *arg2,
       pBot->current_aiming_episode_data.clear();
       pBot->aiming_episode_step_count = 0;
       pBot->f_next_rl_aim_action_time = gpGlobals->time;
+      pBot->has_last_aim_state_and_action = false;
+      pBot->last_shot_fired_was_by_rl = false;
 
       if (!pBot->aiming_nn_initialized) { // If persistence didn't load it
           RL_NN_Initialize_Aiming(&pBot->aiming_rl_nn, RL_AIMING_STATE_SIZE, RL_AIMING_HIDDEN_LAYER_SIZE, RL_AIMING_OUTPUT_SIZE, true, NULL);
@@ -1847,8 +1866,26 @@ void BotThink( bot_t *pBot )
 
          pBot->need_to_initialize = FALSE;
 
+         // Call advanced chat handler for being killed by an enemy
+         if (pBot->killer_edict != NULL && !FNullEnt(pBot->killer_edict) && bot_advanced_chat_enable.value > 0) {
+             // Check if the killer is not the bot itself (e.g. suicide, world)
+             if (pBot->killer_edict != pBot->pEdict) {
+                // Check if killer is not a teammate (if teamplay is on)
+                bool is_teamkill = false;
+                if (is_team_play && UTIL_GetTeam(pBot->killer_edict) == pBot->bot_team && pBot->killer_edict != pBot->pEdict) {
+                    is_teamkill = true;
+                }
+
+                if (is_teamkill) {
+                    AdvancedChat_HandleGameEvent(pBot, CHAT_EVENT_WAS_KILLED_BY_TEAMMATE, pBot->killer_edict, NULL, NULL);
+                } else {
+                    AdvancedChat_HandleGameEvent(pBot, CHAT_EVENT_WAS_KILLED_BY_ENEMY, pBot->killer_edict, NULL, NULL);
+                }
+             }
+         }
+
          // did another player kill this bot AND bot whine messages loaded AND
-         // has the bot been alive for at least 15 seconds AND
+         // has the bot been alive for at least 15 seconds AND (original HPB whine logic)
          if ((pBot->killer_edict != NULL) && (bot_whine_count > 0) &&
              ((pBot->f_bot_spawn_time + 15.0) <= gpGlobals->time))
          {
@@ -1968,6 +2005,31 @@ void BotThink( bot_t *pBot )
 
          BotChatFillInName(pBot->bot_say_msg, chat_text, chat_name, bot_name);
       }
+   }
+   // N-gram based idle chat addition
+   else if (IsAlive(pEdict) && // Only try to chat if alive
+            bot_advanced_chat_enable.value > 0 &&
+            bot_ngram_chat_enable.value > 0 &&
+            g_chat_ngram_model.n_value > 0 && !g_chat_ngram_model.model_data.empty() &&
+            RANDOM_LONG(1, 100) <= (int)bot_ngram_chat_idle_frequency.value) {
+
+       if (gpGlobals->time >= pBot->f_bot_chat_time) { // Respect general cooldown
+           std::string seed_phrase = "";
+           if (g_chat_ngram_model.n_value > 1 && RANDOM_LONG(0, 2) == 0) {
+               const char* common_starters[] = {"the", "i", "it", "enemy", "team", "this", "that"}; // Added more
+               seed_phrase = common_starters[RANDOM_LONG(0, (sizeof(common_starters)/sizeof(char*)) -1 )];
+           }
+
+           std::string ngram_sentence = AdvancedChat_GenerateNgramSentence(&g_chat_ngram_model, seed_phrase, 12);
+
+           if (!ngram_sentence.empty() && ngram_sentence.length() < NGRAM_BOTTHINK_MAX_LEN && ngram_sentence.length() > 3) {
+               // Use UTIL_HostSay directly, as b_bot_say and bot_say_msg are for the older system.
+               // Ensure UTIL_HostSay is safe to call with potentially formatted strings if any placeholders were used.
+               // For N-gram, usually raw text is fine.
+               UTIL_HostSay(pEdict, 0, (char*)ngram_sentence.c_str());
+               pBot->f_bot_chat_time = gpGlobals->time + RANDOM_FLOAT(NGRAM_BOTTHINK_MIN_INTERVAL, NGRAM_BOTTHINK_MAX_INTERVAL);
+           }
+       }
    }
 
 
