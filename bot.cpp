@@ -1955,82 +1955,82 @@ void BotThink( bot_t *pBot )
       return;
    }
 
-      if ((bot_chat_count > 0) && (pBot->f_bot_chat_time < gpGlobals->time))
-   {
-      pBot->f_bot_chat_time = gpGlobals->time + 30.0;
+    if ((bot_chat_count > 0) && (pBot->f_bot_chat_time < gpGlobals->time))
+    {
+        pBot->f_bot_chat_time = gpGlobals->time + 30.0; // Cooldown for original chat system
 
-      if (RANDOM_LONG(1,100) <= pBot->chat_percent)
-      {
-         int chat_index;
-         bool used;
-         int i, recent_count;
+        if (RANDOM_LONG(1,100) <= pBot->chat_percent)
+        {
+            int chat_index;
+            bool used;
+            int i, recent_count;
 
-         // set chat flag and time to chat...
-         pBot->b_bot_say = TRUE;
-         pBot->f_bot_say = gpGlobals->time + 5.0 + RANDOM_FLOAT(0.0, 5.0);
+            // set chat flag and time to chat...
+            pBot->b_bot_say = TRUE;
+            pBot->f_bot_say = gpGlobals->time + 5.0 + RANDOM_FLOAT(0.0, 5.0);
 
-         recent_count = 0;
+            recent_count = 0;
 
-         while (recent_count < 5)
-         {
-            chat_index = RANDOM_LONG(0, bot_chat_count-1);
-
-            used = FALSE;
-
-            for (i=0; i < 5; i++)
+            while (recent_count < 5)
             {
-               if (recent_bot_chat[i] == chat_index)
-                  used = TRUE;
+                chat_index = RANDOM_LONG(0, bot_chat_count-1);
+
+                used = FALSE;
+
+                for (i=0; i < 5; i++)
+                {
+                    if (recent_bot_chat[i] == chat_index)
+                    used = TRUE;
+                }
+
+                if (used)
+                    recent_count++;
+                else
+                    break;
             }
 
-            if (used)
-               recent_count++;
+            for (i=4; i > 0; i--)
+                recent_bot_chat[i] = recent_bot_chat[i-1];
+
+            recent_bot_chat[0] = chat_index;
+
+            if (bot_chat[chat_index].can_modify)
+                BotChatText(bot_chat[chat_index].text, chat_text);
             else
-               break;
-         }
+                strcpy(chat_text, bot_chat[chat_index].text);
 
-         for (i=4; i > 0; i--)
-            recent_bot_chat[i] = recent_bot_chat[i-1];
+            strcpy(chat_name, STRING(pBot->pEdict->v.netname));
 
-         recent_bot_chat[0] = chat_index;
+            bot_name = STRING(pEdict->v.netname);
 
-         if (bot_chat[chat_index].can_modify)
-            BotChatText(bot_chat[chat_index].text, chat_text);
-         else
-            strcpy(chat_text, bot_chat[chat_index].text);
-
-         strcpy(chat_name, STRING(pBot->pEdict->v.netname));
-
-         bot_name = STRING(pEdict->v.netname);
-
-         BotChatFillInName(pBot->bot_say_msg, chat_text, chat_name, bot_name);
-      }
-   }
-   // N-gram based idle chat addition
-   else if (IsAlive(pEdict) && // Only try to chat if alive
+            BotChatFillInName(pBot->bot_say_msg, chat_text, chat_name, bot_name);
+        }
+    }
+    // N-gram based idle chat addition
+    else if (IsAlive(pEdict) && // Only try to chat if alive
             bot_advanced_chat_enable.value > 0 &&
             bot_ngram_chat_enable.value > 0 &&
             g_chat_ngram_model.n_value > 0 && !g_chat_ngram_model.model_data.empty() &&
             RANDOM_LONG(1, 100) <= (int)bot_ngram_chat_idle_frequency.value) {
 
-       if (gpGlobals->time >= pBot->f_bot_chat_time) { // Respect general cooldown
-           std::string seed_phrase = "";
-           if (g_chat_ngram_model.n_value > 1 && RANDOM_LONG(0, 2) == 0) {
-               const char* common_starters[] = {"the", "i", "it", "enemy", "team", "this", "that"}; // Added more
-               seed_phrase = common_starters[RANDOM_LONG(0, (sizeof(common_starters)/sizeof(char*)) -1 )];
-           }
+        if (gpGlobals->time >= pBot->f_bot_chat_time) { // Respect general cooldown
+            std::string seed_phrase = "";
+            // For N>1, occasionally use a common seed. For N=1, GenerateNgramSentence should handle empty seed.
+            if (g_chat_ngram_model.n_value > 1 && RANDOM_LONG(0, 2) == 0) {
+                const char* common_starters[] = {"the", "i", "it", "enemy", "team", "this", "that", "we", "need", "go"};
+                seed_phrase = common_starters[RANDOM_LONG(0, (sizeof(common_starters)/sizeof(char*)) -1 )];
+            }
 
-           std::string ngram_sentence = AdvancedChat_GenerateNgramSentence(&g_chat_ngram_model, seed_phrase, 12);
+            // Generate a sentence with a max of 12 words. Use existing constants.
+            std::string ngram_sentence = AdvancedChat_GenerateNgramSentence(&g_chat_ngram_model, seed_phrase, 12);
 
-           if (!ngram_sentence.empty() && ngram_sentence.length() < NGRAM_BOTTHINK_MAX_LEN && ngram_sentence.length() > 3) {
-               // Use UTIL_HostSay directly, as b_bot_say and bot_say_msg are for the older system.
-               // Ensure UTIL_HostSay is safe to call with potentially formatted strings if any placeholders were used.
-               // For N-gram, usually raw text is fine.
-               UTIL_HostSay(pEdict, 0, (char*)ngram_sentence.c_str());
-               pBot->f_bot_chat_time = gpGlobals->time + RANDOM_FLOAT(NGRAM_BOTTHINK_MIN_INTERVAL, NGRAM_BOTTHINK_MAX_INTERVAL);
-           }
-       }
-   }
+            if (!ngram_sentence.empty() && ngram_sentence.length() < NGRAM_BOTTHINK_MAX_LEN && ngram_sentence.length() > 3) { // Min length 3
+                UTIL_HostSay(pEdict, 0, (char*)ngram_sentence.c_str());
+                // Update the main chat cooldown timer for this bot. Use existing constants.
+                pBot->f_bot_chat_time = gpGlobals->time + RANDOM_FLOAT(NGRAM_BOTTHINK_MIN_INTERVAL, NGRAM_BOTTHINK_MAX_INTERVAL);
+            }
+        }
+    }
 
 
    // set this for the next time the bot dies so it will initialize stuff
@@ -3112,5 +3112,3 @@ void BotThink( bot_t *pBot )
 
    return;
 }
-
-[end of bot.cpp]

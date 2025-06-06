@@ -24,6 +24,7 @@
 #include "bot_objective_discovery.h" // For Objective Discovery functions
 #include "bot_neuro_evolution.h" // For NE_PerformEvolutionaryCycle and constants
 #include "bot_nlp_chat.h"      // For NLP chat functions and model access
+#include "bot_ngram_functions.h" // For N-gram model loading and generation
 #include <vector>              // For std::vector (used in NLP command)
 #include <string>              // For std::string (used in NLP command)
 #include <cstdlib>             // For srand, atoi
@@ -123,6 +124,10 @@ cvar_t bot_rl_aim_action_interval = {"bot_rl_aim_action_interval", "0.1", FCVAR_
 // CVar for NLP Chat Model
 cvar_t bot_chat_use_nlp_model = {"bot_chat_use_nlp_model", "0", FCVAR_SERVER};
 
+// CVars for N-gram Chat
+cvar_t bot_ngram_chat_enable = {"bot_ngram_chat_enable", "1", FCVAR_SERVER};
+cvar_t bot_ngram_chat_idle_frequency = {"bot_ngram_chat_idle_frequency", "10", FCVAR_SERVER}; // % chance
+
 edict_t *pent_info_tfdetect = NULL;
 edict_t *pent_info_ctfdetect = NULL;
 edict_t *pent_info_frontline = NULL;
@@ -215,6 +220,10 @@ void GameDLLInit( void )
    // Register NLP Chat CVar
    CVAR_REGISTER(&bot_chat_use_nlp_model);
 
+   // Register N-gram Chat CVars
+   CVAR_REGISTER(&bot_ngram_chat_enable);
+   CVAR_REGISTER(&bot_ngram_chat_idle_frequency);
+
    // Seed random number generator (globally for the DLL)
    srand((unsigned int)time(NULL));
 
@@ -237,12 +246,12 @@ void GameDLLInit( void )
    // Load Advanced Categorized Chat File
    AdvancedChat_LoadChatFile("HPB_bot_adv_chat.txt");
 
-   // Load N-gram Chat Model Data
-   if (AdvancedChat_LoadNgramData("user/ngram_chat_model.txt")) { // Example filename
-       SERVER_PRINT("N-gram chat model loaded successfully.\n");
-   } else {
-       SERVER_PRINT("Warning: Failed to load N-gram chat model from user/ngram_chat_model.txt. N-gram chat may be disabled or ineffective.\n");
-   }
+   // Load N-gram Chat Model Data (This call is already present as per analysis)
+   // if (AdvancedChat_LoadNgramData("user/ngram_chat_model.txt")) {
+   //     SERVER_PRINT("N-gram chat model loaded successfully from user/ngram_chat_model.txt.\n");
+   // } else {
+   //     SERVER_PRINT("Warning: Failed to load N-gram chat model from user/ngram_chat_model.txt. N-gram chat may be disabled or ineffective.\n");
+   // }
 
    RETURN_META (MRES_IGNORED);
 }
